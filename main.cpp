@@ -3,8 +3,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <map>
+#include <sys/stat.h>
 
 #define ARENA_IMPLEMENTATION
 #include <arena.h> 
@@ -17,12 +20,23 @@
 
 // :sprite
 const Vector4 PLAYER = {1008, 1008, 16, 16};
-const Vector4 TILE = {0, 0, 64, 64};
+
+std::map<int, Vector4> tiles_sprites = {
+	{0, {0, 0, 16, 16}},
+	{5, {80, 0, 16, 16}},
+	{64, {0, 16, 16, 16}},
+	{128, {0, 32, 16, 16}},
+	{192, {0, 48, 16, 16}},
+
+};
+
+
 
 Arena arena = {};
 Arena temp_arena = {};
 
 // :define
+#define TILE_SIZE 16
 #define v2(x, y) Vector2{float(x), float(y)}
 #define v2of(val) v2(val, val)
 #define v4(x, y, z, w) (Vector4){x, y, z, w}
@@ -36,6 +50,19 @@ Arena temp_arena = {};
 #define ZERO v2of(0)
 
 typedef void* rawptr;
+
+void pop_tiles() {
+	for(int x = 0; x < 64; x++) {
+		for(int y = 0; y < 64; y++) {
+			tiles_sprites[y * 64 + x] = {
+				float(x) * TILE_SIZE,
+				float(y) * TILE_SIZE,
+				TILE_SIZE,
+				TILE_SIZE,
+			};	
+		}
+	}
+}
 
 int signd(int x) {
     return (x > 0) - (x < 0);
@@ -178,11 +205,13 @@ enum EntityId {
 enum EntityType {
 	ET_NONE,
 	ET_COLLECTABLE,
+	ET_MOVING_PLAT,
 };
 
 enum EntityProp {
 	EP_NONE,
 	EP_COLLIDABLE,
+	EP_MOVING,
 };
 
 struct ListEntityProp {
@@ -192,6 +221,7 @@ struct ListEntityProp {
 };
 
 struct Entity {
+	int handle;
 	Vector2 pos, vel, size, remainder;
 	EntityId id;
 	EntityType type;
@@ -200,6 +230,8 @@ struct Entity {
 	bool grounded;
 	Entity* last_collided;
 	rawptr user_data;
+	float facing;
+	Entity* riding;
 };
 
 void en_add_props(Entity* entity, std::initializer_list<EntityProp> props) {
@@ -235,8 +267,6 @@ Rectangle en_box(Entity en) {
 // :data
 #define MAP_SIZE 100
 #define MAX_ENTITIES 1024
-#define TILE_SIZE 64
-
 
 struct iv2 {
 	int x, y;
@@ -263,6 +293,7 @@ State *state = NULL;
 Entity* new_en() {
 	for(int i = 0; i < MAX_ENTITIES; i++) {
 		if (!state->entities[i].valid) {
+			state->entities[i].handle = i;
 			return &state->entities[i];
 		}
 	}
@@ -297,13 +328,16 @@ bool en_collides_with(Entity* e, ListEntity entities, Vector2 new_pos) {
 	Rectangle rect_at = rv2(new_pos, e->size);
 	for (int i = 0; i < entities.count; i++) {
 		if(CheckCollisionRecs(rect_at, en_box(entities.items[i]))) {
+			e->last_collided = &state->entities[entities.items[i].handle];
 			return true;
 		}
 	}
 	return false;
 }
 
- void actor_move_x(ListEntity collidables, Entity *e, float amount) {
+typedef bool(*on_collide)(Entity*);
+
+ void actor_move_x(ListEntity collidables, Entity *e, float amount, on_collide callback = nullptr) {
     e->remainder.x += amount;
     int move = round(e->remainder.x);
     if (move != 0) {
@@ -314,6 +348,9 @@ bool en_collides_with(Entity* e, ListEntity entities, Vector2 new_pos) {
                 e->pos.x += sign;
                 move -= sign;
             } else {
+				if (callback) {
+					callback(e);
+				}
                 if (e->last_collided && !en_has_prop(*e->last_collided, EP_COLLIDABLE)) {
                     e->pos.x += sign;
                     move -= sign;
@@ -325,7 +362,7 @@ bool en_collides_with(Entity* e, ListEntity entities, Vector2 new_pos) {
     }
 }
 
-void actor_move_y(ListEntity collidables, Entity *e, float amount) {
+void actor_move_y(ListEntity collidables, Entity *e, float amount, on_collide callback = nullptr) {
     e->remainder.y += amount;
     int move = round(e->remainder.y);
     if (move != 0) {
@@ -336,6 +373,9 @@ void actor_move_y(ListEntity collidables, Entity *e, float amount) {
                 e->pos.y += sign;
                 move -= sign;
             } else {
+				if (callback) {
+					callback(e);
+				}
                 if (e->last_collided && !en_has_prop(*e->last_collided, EP_COLLIDABLE)) {
                     e->pos.y += sign;
                     move -= sign;
@@ -383,29 +423,69 @@ Entity* en_collider(Vector2 pos, Vector2 size) {
 	return en;
 }
 
+struct PlayerData {
+	bool wall_jump;
+};
+
 // :player
 Entity* en_player() {
 	Entity* en = new_en();
-	
+
 	WorldPos pos = {0, MAP_SIZE - 12};
 	en_setup(en, to_render_pos(pos), v2of(16));
 
+	en->user_data = arena_alloc(&arena, sizeof(PlayerData));
+
 	return en;
+}
+
+// :player
+bool player_collide_callback(Entity* self) {
+	Entity* other = self->last_collided;
+	//printf("%f %f %f %f\n%f %f %f %f\n", 
+	//	self->pos.x, self->pos.y, self->size.x, self->size.y,
+	//	other->pos.x, other->pos.y, other->size.x, other->size.y 
+	//);
+
+	if (other->pos.x == self->pos.x + self->size.x
+	 || other->pos.x + other->size.x == self->pos.x) {
+		if(!self->grounded) {
+			((PlayerData*)self->user_data)->wall_jump = true;
+		}
+	}
+
+	if (!self->riding) {
+		if(other->type == ET_MOVING_PLAT && self->pos.y < other->pos.y) {
+			self->riding = other;
+		}
+	}
+
+	return true;
 }
 
 // :player
 void en_player_update(Entity* self) {
  	
     if (IsKeyDown(KEY_A)) {
+		self->facing = -1;	
         self->vel.x = approach(self->vel.x, -2.0, 22 * GetFrameTime());
     } else if (IsKeyDown(KEY_D)) {
+		self->facing = 1;
         self->vel.x = approach(self->vel.x, 2.0, 22 * GetFrameTime());
     }
 
     if (IsKeyPressed(KEY_SPACE) && self->grounded) {
         self->grounded = false;
         self->vel.y = -5;
+		self->riding = nullptr;
     }
+
+	PlayerData* data = (PlayerData*)self->user_data;
+
+	if (IsKeyPressed(KEY_SPACE) && data->wall_jump) {
+		self->vel.y = -5;
+		data->wall_jump = false;
+	}
 
     if (!IsKeyDown(KEY_A) && !IsKeyDown(KEY_D)) {
         if (self->grounded) {
@@ -415,11 +495,70 @@ void en_player_update(Entity* self) {
         }
     }
 
-	ListEntity collidables = get_all_with_prop(EP_COLLIDABLE);
-	//fixme: add callbacks
-    actor_move_x(collidables, self, self->vel.x);
-    self->vel.y = approach(self->vel.y, 3.6, 13 * GetFrameTime());
-    actor_move_y(collidables, self, self->vel.y);
+	// fixme:
+	if(self->riding) {
+		self->pos.x = self->riding->pos.x;
+	}
+
+	ListEntity collidables = get_all_with_prop(EP_COLLIDABLE, &temp_arena);
+   	actor_move_x(collidables, self, self->vel.x, player_collide_callback);
+   	self->vel.y = approach(self->vel.y, 3.6, 13 * GetFrameTime());
+   	actor_move_y(collidables, self, self->vel.y, player_collide_callback);
+}
+
+struct MovingPlatData {
+	Vector2 start;
+	Vector2 end;
+	int p;
+};
+
+// :moving_plat
+Entity* en_moving_plat(Vector2 pos, Vector2 size, Vector2 start, Vector2 end) {
+	Entity* en = new_en();
+	
+	en_setup(en, pos, size);
+
+	en->type = ET_MOVING_PLAT;
+	en_add_props(en, {EP_MOVING, EP_COLLIDABLE});
+
+	MovingPlatData* user_data = (MovingPlatData*)arena_alloc(&arena, sizeof(MovingPlatData));
+	user_data->start = start;
+	user_data->end = end;
+	user_data->p = 0;
+
+	en->user_data = user_data;
+
+	return en;
+}
+
+// :moving_plat
+void en_moving_plat_update(Entity* self) {
+	
+	MovingPlatData* data = (MovingPlatData*)self->user_data;
+
+	if (Vector2Equals(self->pos, data->start)) {
+		data->p = 1;
+	} else if (Vector2Equals(self->pos, data->end)) {
+		data->p = 0;
+	}
+
+	switch (data->p) {
+		case 0:
+			self->pos = Vector2MoveTowards(self->pos, data->start, 100 * GetFrameTime());
+			break;
+		case 1:
+			self->pos = Vector2MoveTowards(self->pos, data->end, 100 * GetFrameTime());
+			break;
+	
+	}
+}
+
+// :moving_plat
+void en_moving_plat_render(Entity self) {
+	draw_quad(v4v2(self.pos, self.size));
+	MovingPlatData data = *(MovingPlatData*)self.user_data;
+	draw_quad(v4v2(data.end, v2of(1)), RED);
+	draw_quad(v4v2(data.start, v2of(1)), RED);
 }
 
 int main(void) {
@@ -435,6 +574,7 @@ int main(void) {
 	RenderTexture2D game_texture = LoadRenderTexture(RENDER_SIZE.x, RENDER_SIZE.y);
 
 	// :init
+	pop_tiles();
 	renderer = (Renderer*)arena_alloc(&arena, sizeof(Renderer));
 	renderer->objs = {};
 	renderer->atlas = atlas;
@@ -444,48 +584,74 @@ int main(void) {
 	cam.offset = RENDER_SIZE / v2of(2);
 
 	state = (State*)arena_alloc(&arena, sizeof(State));
-	memset(state->map, 0, sizeof(int) * (MAP_SIZE * MAP_SIZE));
+	memset(state->map, -1, sizeof(int) * (MAP_SIZE * MAP_SIZE));
 	memset(state->entities, 0, sizeof(Entity) * MAX_ENTITIES);
 
 	state->player = en_player();
-	// :temp
-	Entity* collectable = en_collectable(to_render_pos({10, MAP_SIZE - 11}), EID_NONE);
 
-	cute_tiled_map_t* map = cute_tiled_load_map_from_file("./res/map.tmj", nullptr);
+	// :tiled
+	{
+		cute_tiled_map_t* map = cute_tiled_load_map_from_file("./res/map.tmj", nullptr);
 
-	cute_tiled_layer_t* layer = map->layers;
-	while (layer) {
-		
+		cute_tiled_layer_t* layer = map->layers;
+		while (layer) {
+			
 
-		if (strncmp("Colliders", layer->name.ptr, 9) == 0) {
-			cute_tiled_object_t* obj = layer->objects;
-			while (obj) {
-				
-				// fixme: check if point or ellipse or polygon	
-
-				printf("Name: %s\n", obj->name.ptr);
-				printf("   x: %f, y: %f, w: %f, h: %f\n", obj->x, obj->y, obj->width, obj->height);
-
-				en_collider(v2(obj->x, obj->y), v2(obj->width, obj->height));
-
-				obj = obj->next;
-			}
-		} else if (strncmp("map", layer->name.ptr, 3) == 0) {
-			assert(layer->data_count == MAP_SIZE * MAP_SIZE && "Map changed size! not handled in code");
-			for (int y = MAP_SIZE - 10; y < MAP_SIZE; y++) {
-				for(int x = 0; x < MAP_SIZE; x++) {
-					state->map[y * MAP_SIZE + x] = layer->data[y * MAP_SIZE + x];
+			if (strncmp("Colliders", layer->name.ptr, 9) == 0) {
+				cute_tiled_object_t* obj = layer->objects;
+				while (obj) {
+					en_collider(v2(obj->x, obj->y), v2(obj->width, obj->height));
+					obj = obj->next;
 				}
+			} else if (strncmp("map", layer->name.ptr, 3) == 0) {
+				assert(layer->data_count == MAP_SIZE * MAP_SIZE && "Map changed size! not handled in code");
+				for (int y = 0; y < MAP_SIZE; y++) {
+					for(int x = 0; x < MAP_SIZE; x++) {
+						if (layer->data[y * MAP_SIZE + x] != 0) {
+							state->map[y * MAP_SIZE + x] = layer->data[y * MAP_SIZE + x] - 1;
+						}
+					}
+				}
+			} else if (strncmp("points", layer->name.ptr, 6) == 0) {
+				cute_tiled_object_t* obj = layer->objects;
+				while (obj) {
+					
+					if (strncmp("spawn", obj->name.ptr, 5) == 0) {
+						state->player->pos = v2(obj->x, obj->y);
+					}
+
+					obj = obj->next;
+				}
+			} else if (strncmp("movables", layer->name.ptr, 6) == 0) {
+				cute_tiled_object_t* obj = layer->objects;
+				while (obj) {
+
+					assert(obj->property_count == 2 && "Movable not setup correctly");
+					
+					cute_tiled_property_t* props = obj->properties;
+					int dir = props[0].data.integer; 					
+					int tiles_move = props[1].data.integer;
+
+					Vector2 pos = v2(obj->x, obj->y);
+					// fixme: check out to this
+					Vector2 size = v2(3 * TILE_SIZE, TILE_SIZE);
+
+					// fixme: implement y
+					Vector2 end = {pos.x + (dir * (tiles_move * TILE_SIZE)), pos.y};
+
+					en_moving_plat(pos, size, pos, end);
+					
+					obj = obj->next;	
+				}
+			} else {
+				printf("Layer not handled: %s\n", layer->name.ptr);
 			}
-		} else {
-			printf("Layer not handled: %s\n", layer->name.ptr);
+
+			layer = layer->next;
 		}
 
-		layer = layer->next;
+		cute_tiled_free_map(map);
 	}
-
-	cute_tiled_free_map(map);
-
 	assert(renderer != NULL && "arena returned null");
 
 	// :loop
@@ -511,6 +677,9 @@ int main(void) {
 					case ET_COLLECTABLE:
 						en_collectable_update(en);
 						break;
+					case ET_MOVING_PLAT:
+						en_moving_plat_update(en);
+						break;
 				}
 			}
 		}
@@ -526,10 +695,15 @@ int main(void) {
 					{
 						for(int y = 0; y < MAP_SIZE; y++) {
 							for(int x = 0; x < MAP_SIZE; x++) {
-								if (get_tile({x, y})) {
-									//fixme: this will break!
-									Vector4 to_draw = v4(float(get_tile({x, y})) * TILE_SIZE, 0, TILE_SIZE, TILE_SIZE);
-									draw_texture_v2(to_draw, v2(x, y) * TILE_SIZE);
+								int tile_id = get_tile({x, y});
+								if(tile_id != -1) {
+									if(tiles_sprites.find(tile_id) != tiles_sprites.end()) {
+										Vector4 src = tiles_sprites[get_tile({x, y})];
+										draw_texture_v2(src, v2(x, y) * TILE_SIZE);
+									} else {
+										printf("Id: %d\n", tile_id);
+										exit(1);	
+									}
 								}
 							}
 						}
@@ -550,11 +724,14 @@ int main(void) {
 								case ET_COLLECTABLE:
 									en_collectable_render(en);
 									break;
+								case ET_MOVING_PLAT:
+									en_moving_plat_render(en);
+									break;
 							}
 						}
 					}
 
-#if 1
+#if 0
 					ListEntity collidables = get_all_with_prop(EP_COLLIDABLE, &temp_arena);
 					for(int i = 0; i < collidables.count; i++) {
 						draw_quad_lines(to_v4(en_box(collidables.items[i])));
