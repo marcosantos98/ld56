@@ -5,11 +5,15 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+
 #define ARENA_IMPLEMENTATION
 #include <arena.h> 
 
 #include <raylib.h>
 #include <raymath.h>
+
+#define CUTE_TILED_IMPLEMENTATION
+#include <cute_tiled.h>
 
 // :sprite
 const Vector4 PLAYER = {1008, 1008, 16, 16};
@@ -444,19 +448,43 @@ int main(void) {
 	memset(state->entities, 0, sizeof(Entity) * MAX_ENTITIES);
 
 	state->player = en_player();
-		// :temp
-	for (int y = MAP_SIZE - 10; y < MAP_SIZE; y++) {
-		for(int x = 0; x < MAP_SIZE; x++) {
-			state->map[y * MAP_SIZE + x] = 1;
-		}
-	}
-	state->map[(MAP_SIZE - 11) * MAP_SIZE + 2] = 1;
-
 	// :temp
 	Entity* collectable = en_collectable(to_render_pos({10, MAP_SIZE - 11}), EID_NONE);
-	Vector2 floor_pos = to_render_pos({0, MAP_SIZE - 10});
-	Vector2 size = v2(MAP_SIZE, 1) * TILE_SIZE;
-	Entity* floor = en_collider(floor_pos, size);
+
+	cute_tiled_map_t* map = cute_tiled_load_map_from_file("./res/map.tmj", nullptr);
+
+	cute_tiled_layer_t* layer = map->layers;
+	while (layer) {
+		
+
+		if (strncmp("Colliders", layer->name.ptr, 9) == 0) {
+			cute_tiled_object_t* obj = layer->objects;
+			while (obj) {
+				
+				// fixme: check if point or ellipse or polygon	
+
+				printf("Name: %s\n", obj->name.ptr);
+				printf("   x: %f, y: %f, w: %f, h: %f\n", obj->x, obj->y, obj->width, obj->height);
+
+				en_collider(v2(obj->x, obj->y), v2(obj->width, obj->height));
+
+				obj = obj->next;
+			}
+		} else if (strncmp("map", layer->name.ptr, 3) == 0) {
+			assert(layer->data_count == MAP_SIZE * MAP_SIZE && "Map changed size! not handled in code");
+			for (int y = MAP_SIZE - 10; y < MAP_SIZE; y++) {
+				for(int x = 0; x < MAP_SIZE; x++) {
+					state->map[y * MAP_SIZE + x] = layer->data[y * MAP_SIZE + x];
+				}
+			}
+		} else {
+			printf("Layer not handled: %s\n", layer->name.ptr);
+		}
+
+		layer = layer->next;
+	}
+
+	cute_tiled_free_map(map);
 
 	assert(renderer != NULL && "arena returned null");
 
@@ -498,8 +526,10 @@ int main(void) {
 					{
 						for(int y = 0; y < MAP_SIZE; y++) {
 							for(int x = 0; x < MAP_SIZE; x++) {
-								if (get_tile({x, y}) == 1) {
-									draw_texture_v2(TILE, v2(x, y) * TILE_SIZE);
+								if (get_tile({x, y})) {
+									//fixme: this will break!
+									Vector4 to_draw = v4(float(get_tile({x, y})) * TILE_SIZE, 0, TILE_SIZE, TILE_SIZE);
+									draw_texture_v2(to_draw, v2(x, y) * TILE_SIZE);
 								}
 							}
 						}
