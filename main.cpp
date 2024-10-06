@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <iterator>
 #include <map>
 #include <sys/stat.h>
 
@@ -29,8 +30,6 @@ std::map<int, Vector4> tiles_sprites = {
 	{192, {0, 48, 16, 16}},
 
 };
-
-
 
 Arena arena = {};
 Arena temp_arena = {};
@@ -130,21 +129,53 @@ struct DrawObj {
 	float line_tick;
 };
 
-typedef struct ListDrawObj {
+struct ListDrawObj {
 	DrawObj* items;
 	int capacity;
 	int count;
-} ListDrawObj;
+};
 
-typedef struct Renderer {
+struct RenderLayer {
 	ListDrawObj objs;
+};
+
+struct FIFO {
+	int* items;
+	int count;
+	int capacity;
+};
+
+int fifo_pop(FIFO* fifo) {
+	int val = fifo->items[fifo->count-1];
+	fifo->count -= 1;
+	return val;
+}
+
+void fifo_push(FIFO* fifo, int val) {
+	arena_da_append(&arena, fifo, val);
+}
+
+#define MAX_LAYERS 1024
+struct Renderer {
+	RenderLayer layers[MAX_LAYERS];	
 	Texture2D atlas;
-} Renderer;
+	int current_layer;
+	FIFO layer_stack;
+};
 
 Renderer* renderer = NULL;
 
+void push_layer(int layer) {
+	fifo_push(&renderer->layer_stack, renderer->current_layer);
+	renderer->current_layer = layer;
+}
+
+void pop_layer() {
+	renderer->current_layer = fifo_pop(&renderer->layer_stack);
+}
+
 void renderer_add(DrawObj obj) {
-	arena_da_append(&arena, &renderer->objs, obj);
+	arena_da_append(&arena, &renderer->layers[renderer->current_layer].objs, obj);
 }
 
 void draw_quad(Vector4 dest, Color tint = WHITE) {
@@ -176,23 +207,26 @@ void draw_texture_v2(Vector4 src, Vector2 pos, Color tint = WHITE) {
 }
 
 void flush_renderer() {
-	for (int i = 0; i < renderer->objs.count; i++) {
-		DrawObj it = renderer->objs.items[i];
-		switch (it.type) {
-			case NONE:
-				break;
-			case DRAW_OBJ_QUAD:
-				DrawRectangleRec(to_rect(it.dest), it.tint);
-				break;
-			case DRAW_OBJ_TEXTURE:
-				DrawTextureRec(renderer->atlas, to_rect(it.src), {it.dest.x, it.dest.y}, it.tint);
-				break;
-			case DRAW_QUAD_LINES:
-				DrawRectangleLinesEx(to_rect(it.dest), it.line_tick, it.tint);
-				break;
-		}	
+	for(int i = 0; i < MAX_LAYERS; i++) {
+		RenderLayer* layer = &renderer->layers[i];
+		for (int i = 0; i < layer->objs.count; i++) {
+			DrawObj it = layer->objs.items[i];
+			switch (it.type) {
+				case NONE:
+					break;
+				case DRAW_OBJ_QUAD:
+					DrawRectangleRec(to_rect(it.dest), it.tint);
+					break;
+				case DRAW_OBJ_TEXTURE:
+					DrawTextureRec(renderer->atlas, to_rect(it.src), {it.dest.x, it.dest.y}, it.tint);
+					break;
+				case DRAW_QUAD_LINES:
+					DrawRectangleLinesEx(to_rect(it.dest), it.line_tick, it.tint);
+					break;
+			}	
+		}
+		layer->objs.count = 0;
 	}
-	renderer->objs.count = 0;
 }
 // ;renderer
 
@@ -206,6 +240,7 @@ enum EntityType {
 	ET_NONE,
 	ET_COLLECTABLE,
 	ET_MOVING_PLAT,
+	ET_DOOR,
 };
 
 enum EntityProp {
@@ -465,8 +500,11 @@ bool player_collide_callback(Entity* self) {
 
 // :player
 void en_player_update(Entity* self) {
- 	
-    if (IsKeyDown(KEY_A)) {
+ 	if(self->riding) {
+		self->vel.x = (self->riding->vel.x * self->riding->facing) * GetFrameTime();
+	}	
+   
+	if (IsKeyDown(KEY_A)) {
 		self->facing = -1;	
         self->vel.x = approach(self->vel.x, -2.0, 22 * GetFrameTime());
     } else if (IsKeyDown(KEY_D)) {
@@ -496,9 +534,7 @@ void en_player_update(Entity* self) {
     }
 
 	// fixme:
-	if(self->riding) {
-		self->pos.x = self->riding->pos.x;
-	}
+
 
 	ListEntity collidables = get_all_with_prop(EP_COLLIDABLE, &temp_arena);
    	actor_move_x(collidables, self, self->vel.x, player_collide_callback);
@@ -528,6 +564,8 @@ Entity* en_moving_plat(Vector2 pos, Vector2 size, Vector2 start, Vector2 end) {
 
 	en->user_data = user_data;
 
+	en->vel.x = 100;
+
 	return en;
 }
 
@@ -538,16 +576,18 @@ void en_moving_plat_update(Entity* self) {
 
 	if (Vector2Equals(self->pos, data->start)) {
 		data->p = 1;
+		self->facing = -1;
 	} else if (Vector2Equals(self->pos, data->end)) {
 		data->p = 0;
+		self->facing = 1;
 	}
 
 	switch (data->p) {
 		case 0:
-			self->pos = Vector2MoveTowards(self->pos, data->start, 100 * GetFrameTime());
+			self->pos = Vector2MoveTowards(self->pos, data->start, self->vel.x * GetFrameTime());
 			break;
 		case 1:
-			self->pos = Vector2MoveTowards(self->pos, data->end, 100 * GetFrameTime());
+			self->pos = Vector2MoveTowards(self->pos, data->end, self->vel.x * GetFrameTime());
 			break;
 	
 	}
@@ -560,6 +600,28 @@ void en_moving_plat_render(Entity self) {
 	draw_quad(v4v2(data.end, v2of(1)), RED);
 	draw_quad(v4v2(data.start, v2of(1)), RED);
 }
+
+// :door
+Entity* en_door(Vector2 pos) {
+	Entity* en = new_en();
+	en_setup(en, pos, v2(16, 71));
+	en->type = ET_DOOR;
+
+	en_add_props(en, {EP_COLLIDABLE});
+
+	return en;
+}
+
+// :door
+void en_door_render(Entity self) {
+	//printf("Current layer: %d\n", renderer->current_layer);
+	draw_texture_v2(v4(64, 157, 17, 71), self.pos);
+}
+
+enum Layer {
+	L_NONE,
+	L_MAP,
+};
 
 int main(void) {
 
@@ -576,7 +638,9 @@ int main(void) {
 	// :init
 	pop_tiles();
 	renderer = (Renderer*)arena_alloc(&arena, sizeof(Renderer));
-	renderer->objs = {};
+	memset(renderer->layers, 0, sizeof(RenderLayer) * MAX_LAYERS);
+	renderer->layer_stack = {};
+	renderer->current_layer = 0;
 	renderer->atlas = atlas;
 
 	Camera2D cam = {};
@@ -622,7 +686,7 @@ int main(void) {
 
 					obj = obj->next;
 				}
-			} else if (strncmp("movables", layer->name.ptr, 6) == 0) {
+			} else if (strncmp("movables", layer->name.ptr, 8) == 0) {
 				cute_tiled_object_t* obj = layer->objects;
 				while (obj) {
 
@@ -642,6 +706,14 @@ int main(void) {
 					en_moving_plat(pos, size, pos, end);
 					
 					obj = obj->next;	
+				}
+			} else if (strncmp("doors", layer->name.ptr, 5) == 0) {
+				cute_tiled_object_t* obj = layer->objects;
+				while (obj) {
+					
+					en_door(v2(obj->x, obj->y));	
+
+					obj = obj->next;
 				}
 			} else {
 				printf("Layer not handled: %s\n", layer->name.ptr);
@@ -666,6 +738,9 @@ int main(void) {
 			// :cam
 			{
 				cam.target = state->player->pos;
+				if (cam.target.x - cam.offset.x <= 0.0) {
+					cam.target.x = cam.offset.x;
+				}
 			}
 
 			for(int i = 0; i < MAX_ENTITIES; i++) {
@@ -693,6 +768,8 @@ int main(void) {
 				{
 					// :map
 					{
+						printf("Before: %d\n", renderer->current_layer);
+						push_layer(L_MAP);
 						for(int y = 0; y < MAP_SIZE; y++) {
 							for(int x = 0; x < MAP_SIZE; x++) {
 								int tile_id = get_tile({x, y});
@@ -707,6 +784,8 @@ int main(void) {
 								}
 							}
 						}
+						pop_layer();
+						printf("After: %d\n", renderer->current_layer);
 					}
 
 					// :player
@@ -726,6 +805,9 @@ int main(void) {
 									break;
 								case ET_MOVING_PLAT:
 									en_moving_plat_render(en);
+									break;
+								case ET_DOOR:
+									en_door_render(en);
 									break;
 							}
 						}
