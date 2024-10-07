@@ -6,15 +6,18 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
-#include <map>
 #include <sys/stat.h>
 
 #define ARENA_IMPLEMENTATION
 #include <arena.h> 
 
+#define MAX_TEXTFORMAT_BUFFERS 4
+#define MAX_TEXT_BUFFER_LENGTH 4096
 #include <raylib.h>
 #include <raymath.h>
-
+#if defined(PLATFORM_WEB)
+#include <emscripten/emscripten.h>
+#endif
 
 // :sprite
 const Vector4 PLAYER = {1008, 1008, 16, 16};
@@ -23,15 +26,11 @@ const Vector4 FLOWER_0 = {208, 0, 16, 16};
 const Vector4 FLOWER_SPOT = {208, 16, 16, 16};
 const Vector4 THING = {208, 48, 48, 64};
 const Vector4 THING_SPOT = {192, 112, 80, 48};
-
-std::map<int, Vector4> tiles_sprites = {
-	{0, {0, 0, 16, 16}},
-	{5, {80, 0, 16, 16}},
-	{64, {0, 16, 16, 16}},
-	{128, {0, 32, 16, 16}},
-	{192, {0, 48, 16, 16}},
-
-};
+const Vector4 FOOD_ICON = {144, 160, 32, 32};
+const Vector4 WORKER_ICON = {176, 160, 32, 32};
+const Vector4 DEFENSE_BUILDING = {224, 320, 32, 48};
+const Vector4 PREDATOR = {224, 160, 32, 32};
+const Vector4 FIREBALL = {208, 160, 16, 16};
 
 Arena arena = {};
 Arena temp_arena = {};
@@ -51,6 +50,27 @@ Arena temp_arena = {};
 #define ZERO v2of(0)
 
 typedef void* rawptr;
+
+struct Time {
+	int h, m, s;
+};
+
+Time seconds_to_hm(int seconds) {
+	Time t = {};
+	t.h = int(seconds / 3600);
+	t.m = int(seconds - (3600 * t.h)) / 60;
+	t.s = int(seconds - (3600 * t.h) - (t.m * 60));
+	return t;
+}
+
+Vector4 grow(Vector4 old, float amt) {
+	return {
+		old.x - amt, 
+		old.y - amt,
+		old.z + amt * 2, 
+		old.w + amt * 2,
+	};
+}
 
 void start_of(Vector4 where, Vector4* it) {
 	it->x = where.x;
@@ -93,6 +113,9 @@ void pad(Vector4* it, Side side, float amt) {
 			break;
 		case LEFT:
 			it->x += amt;
+			break;
+		case RIGHT:
+			it->x -= amt;
 			break;
 	}
 }
@@ -203,7 +226,7 @@ int fifo_pop(FIFO* fifo) {
 }
 
 void fifo_push(FIFO* fifo, int val) {
-	arena_da_append(&arena, fifo, val);
+	arena_da_append(&temp_arena, fifo, val);
 }
 
 #define MAX_LAYERS 1024
@@ -316,19 +339,18 @@ enum EntityId {
 
 enum EntityType {
 	ET_NONE,
-	ET_COLLECTABLE,
-	ET_MOVING_PLAT,
-	ET_DOOR,
+	ET_DEFENSE,
 	ET_FLOWER,
 	ET_THING,
 	ET_WORKER,
+	ET_PREDATOR,
+	ET_FIREBALL,
 	// :type
 };
 
 enum EntityProp {
 	EP_NONE,
-	EP_COLLIDABLE,
-	EP_MOVING,
+	EP_ATTACKABLE,
 };
 
 struct ListEntityProp {
@@ -351,6 +373,8 @@ struct Entity {
 	Entity* riding;
 	bool trigger;
 	bool was_selected;
+	int health;
+	bool attacked;
 };
 
 void en_add_props(Entity* entity, std::initializer_list<EntityProp> props) {
@@ -393,35 +417,45 @@ void en_invalidate(Entity* en) {
 
 // :data
 #define MAP_SIZE 100
-#define MAX_ENTITIES 1024
+#define MAX_ENTITIES 2046 
 #define MAX_LIGHTS 1
 #define PLAYER_LIGHT_RADIUS 20
+#define TIME_FOR_PREDATOR 180
 
-struct iv2 {
-	int x, y;
+enum Task {
+	TASK_NONE,
+	TASK_COLLECT,
+	TASK_REPRODUCE,
+	TASK_DEFENSE,
 };
 
-#define to_iv2(_v2) iv2{int(_v2.x), int(_v2.y)}
-
-typedef iv2 WorldPos;
-WorldPos to_world(Vector2 pos) {
-	return to_iv2(v2_floor(pos / TILE_SIZE));
-}
-
-Vector2 to_render_pos(WorldPos pos) {
-	return to_v2(pos) * TILE_SIZE;
-}
+// :thing
+struct ThingData {
+	Task current_task;
+	float perform_task_time;
+	int food_amt;
+	int worker_amt;
+	int last_worker_amt;
+};
 
 struct State {
-	int map[MAP_SIZE*MAP_SIZE];
 	Entity entities[MAX_ENTITIES];
 	Entity* player;
+	Entity *predator;
+	ThingData* thing_data;
 	Vector2 virtual_mouse;
 	Camera2D cam;
 	bool show_thing_ui;
 	float dt;
 	float dt_speed;
 	bool show_begin_message;
+	float time_for_predator;
+	int flower_cnt;
+	Sound remove_flower;
+	Sound shoot;
+	Sound died;
+	bool lost;
+	bool win;
 };
 State *state = NULL;
 
@@ -446,12 +480,6 @@ Entity* new_en() {
 	return nullptr;
 }
 
-int get_tile(iv2 pos) {
-	return state->map[pos.y * MAP_SIZE + pos.x];
-}
-
-
-
 ListEntity get_all_with_prop(EntityProp prop, Arena* allocator = &arena) {
 	ListEntity list = {};
 
@@ -465,207 +493,19 @@ ListEntity get_all_with_prop(EntityProp prop, Arena* allocator = &arena) {
 	return list;
 }
 
-bool en_collides_with(Entity* e, ListEntity entities, Vector2 new_pos) {
-	Rectangle rect_at = rv2(new_pos, e->size);
-	for (int i = 0; i < entities.count; i++) {
-		if(CheckCollisionRecs(rect_at, en_box(entities.items[i]))) {
-			e->last_collided = &state->entities[entities.items[i].handle];
-			return true;
-		}
-	}
-	return false;
-}
+ListEntity get_all_with_type(EntityType type) {
+	ListEntity list = {};
 
-typedef bool(*on_collide)(Entity*);
-
- void actor_move_x(ListEntity collidables, Entity *e, float amount, on_collide callback = nullptr) {
-    e->remainder.x += amount;
-    int move = round(e->remainder.x);
-    if (move != 0) {
-        e->remainder.x -= move;
-        int sign = signd(move);
-        while (move != 0) {
-            if (!en_collides_with(e, collidables, {e->pos.x + sign, e->pos.y})) {
-                e->pos.x += sign;
-                move -= sign;
-            } else {
-				if (callback) {
-					callback(e);
-				}
-                if (e->last_collided && e->last_collided->trigger) {
-                    e->pos.x += sign;
-                    move -= sign;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-void actor_move_y(ListEntity collidables, Entity *e, float amount, on_collide callback = nullptr) {
-    e->remainder.y += amount;
-    int move = round(e->remainder.y);
-    if (move != 0) {
-        e->remainder.y -= move;
-        int sign = signd(move);
-        while (move != 0) {
-            if (!en_collides_with(e, collidables, {e->pos.x, e->pos.y + sign})) {
-                e->pos.y += sign;
-                move -= sign;
-            } else {
-				if (callback) {
-					callback(e);
-				}
-                if (e->last_collided && e->last_collided->trigger) {
-                    e->pos.y += sign;
-                    move -= sign;
-                } else {
-                    e->vel.y = 0;
-                    break;
-                }
-            }
-        }
-    }
-}
-
-// :collectable
-Entity* en_collectable(Vector2 pos, EntityId id) {
-	Entity* en = new_en();
-	en_setup(en, pos, {16, 16});	
-
-	en->type = ET_COLLECTABLE;
-	en->id = id;
-	en->trigger = true;
-
-	en_add_props(en, {EP_COLLIDABLE});
-
-	return en;
-}
-
-// :collectable
-void en_collectable_update(Entity* self) {
-	self->pos.y += sinf(GetTime() * 10) * .5f;	
-}
-
-//:collectable
-void en_collectable_render(Entity self) {
-	switch (self.id) {
-		case EID_BIRD:
-			draw_texture_v2(BIRD, self.pos);
-			break;
-		default:
-			draw_quad(v4v2(self.pos, self.size));
-			break;
-	}
-}
-
-// :collider
-Entity* en_collider(Vector2 pos, Vector2 size, bool trigger = false) {
-	Entity* en = new_en();
-	
-	en_setup(en, pos, size);
-	en_add_props(en, {EP_COLLIDABLE});
-
-	en->trigger = trigger;
-
-	return en;
-}
-
-struct PlayerData {
-	bool wall_jump;
-	bool wall_jumped;
-};
-
-// :player
-Entity* en_player() {
-	Entity* en = new_en();
-
-	en_setup(en, ZERO, v2of(16));
-
-	en->user_data = arena_alloc(&arena, sizeof(PlayerData));
-
-	return en;
-}
-
-// :player
-bool player_collide_callback(Entity* self) {
-	Entity* other = self->last_collided;
-	//printf("%f %f %f %f\n%f %f %f %f\n", 
-	//	self->pos.x, self->pos.y, self->size.x, self->size.y,
-	//	other->pos.x, other->pos.y, other->size.x, other->size.y 
-	//);
-
-	if (other->pos.x == self->pos.x + self->size.x
-	 || other->pos.x + other->size.x == self->pos.x) {
-		if(!self->grounded) {
-			((PlayerData*)self->user_data)->wall_jump = true;
+	for(Entity entity: state->entities) {
+		if(!entity.valid) { continue;}
+		if( entity.type == type) {
+			arena_da_append(&temp_arena, &list, entity);
 		}
 	}
 
-	if (!self->riding) {
-		if(other->type == ET_MOVING_PLAT && self->pos.y < other->pos.y) {
-			self->riding = other;
-		}
-	}
-
-	if (other->trigger) {
-		printf("Found trigger\n");
-	}
-
-	return true;
+	return list;
 }
 
-// :player
-void en_player_update(Entity* self) {
- 	if(self->riding) {
-		self->vel.x = (self->riding->vel.x * self->riding->facing) * state->dt;
-	}	
-  
-	PlayerData* data = (PlayerData*)self->user_data;
-	
-	if (IsKeyDown(KEY_A)) {
-		self->facing = -1;	
-        self->vel.x = approach(self->vel.x, -2.0, 22 * state->dt);
-    } else if (IsKeyDown(KEY_D)) {
-		self->facing = 1;
-        self->vel.x = approach(self->vel.x, 2.0, 22 * state->dt);
-    }
-
-    if (IsKeyPressed(KEY_SPACE) && self->grounded) {
-        self->grounded = false;
-        self->vel.y = -5;
-		self->riding = nullptr;
-    }
-
-	if (self->grounded) {
-		data->wall_jump = false;
-		data->wall_jumped = false;
-	}
-
-
-	if (IsKeyPressed(KEY_SPACE) && data->wall_jump && !data->wall_jumped) {
-		self->vel.y = -5;
-		data->wall_jumped = true;
-	}
-
-    if (!IsKeyDown(KEY_A) && !IsKeyDown(KEY_D)) {
-        if (self->grounded) {
-            self->vel.x = approach(self->vel.x, 0.0, 10 * state->dt);
-        } else {
-            self->vel.x = approach(self->vel.x, 0.0, 12 * state->dt);
-        }
-    }
-
-	ListEntity collidables = get_all_with_prop(EP_COLLIDABLE, &temp_arena);
-   	actor_move_x(collidables, self, self->vel.x, player_collide_callback);
-   	self->vel.y = approach(self->vel.y, 3.6, 13 * state->dt);
-   	actor_move_y(collidables, self, self->vel.y, player_collide_callback);
-
-	if (FloatEquals(self->vel.y, 0)) {
-		self->grounded = true;
-	}
-}
 enum Layer {
 	L_NONE,
 	L_BACK,
@@ -675,6 +515,80 @@ enum Layer {
 	L_HUD,
 };
 
+
+// :fireball
+Entity* en_fireball(Vector2 pos) {
+	Entity* en = new_en();
+
+	en_setup(en, pos, v2of(16));
+
+	en->type = ET_FIREBALL;
+
+	return en;
+}
+
+//:fireball
+void en_fireball_update(Entity* self) {
+	if (state->predator == nullptr) return;
+	if (!CheckCollisionRecs(en_box(*self), en_box(*state->predator))) {
+		self->pos = Vector2MoveTowards(self->pos, state->predator->pos, 200 * state->dt);
+	} else {
+		state->predator->health -= 2;
+		en_invalidate(self);
+	}
+}
+
+void en_fireball_render(Entity self) {
+	push_layer(L_HUD);
+	draw_texture_v2(FIREBALL, self.pos);	
+	pop_layer();
+}
+
+// :defense
+struct DefenseData {
+	float shoot_time;
+};
+
+// :defense
+Entity* en_defense(Vector2 pos, Vector2 size) {
+	Entity* en = new_en();
+	en_setup(en, pos, size);	
+
+	en->type = ET_DEFENSE;
+
+	DefenseData *data = (DefenseData*)arena_alloc(&arena, sizeof(DefenseData));
+	data->shoot_time = .12f;
+
+	en->health = 3;
+
+	en->user_data = data;
+
+	en_add_props(en, {EP_ATTACKABLE});
+	return en;
+}
+
+void en_defense_update(Entity* self) {
+	if (state->predator == nullptr) return;
+
+	DefenseData* data = (DefenseData*)self->user_data;
+	data->shoot_time -= state->dt;
+	if (Vector2Distance(self->pos, state->predator->pos) < RENDER_SIZE.x / 2 && data->shoot_time < 0) {
+		en_fireball(self->pos);
+		PlaySound(state->shoot);
+		data->shoot_time = 0.12;
+	}
+
+	if(self->health <= 0) {
+		PlaySound(state->died);
+		en_invalidate(self);
+	}
+}
+
+void en_defense_render(Entity self) {
+	push_layer(L_DEBUG_COL);
+	draw_texture_v2(DEFENSE_BUILDING, self.pos);
+	pop_layer();
+}
 
 // :flower
 Entity* en_flower(Vector2 pos) {
@@ -701,64 +615,80 @@ void en_flower_render(Entity self) {
 	pop_layer();
 }
 
-struct Light {
-	Vector2 pos;
-	float radius;
-	Color color;
-
-	int loc_pos;
-	int loc_radius;
-	int loc_color;
+struct PredatorData {
+	int handle;
+	float attack_time;
 };
 
-static Light lights[MAX_LIGHTS] = {0};
-static int light_idx = 0;
+#define PREDATOR_HP 300 
 
-void update_light_data(Shader s, int id) {
-	Light l = lights[id];
+// :predator
+Entity* en_predator(Vector2 pos, Vector2 size) {
+	Entity* en = new_en();
 
-	float pos[2] = {l.pos.x, l.pos.y};
-	SetShaderValue(s, l.loc_pos, pos, SHADER_UNIFORM_VEC2);
+	en_setup(en, pos, size);
+	en->type = ET_PREDATOR;
 
-	SetShaderValue(s, l.loc_radius, &l.radius, SHADER_UNIFORM_FLOAT);
+	en->health = PREDATOR_HP;
 
-	float color[4] = {l.color.r / 255.f, l.color.g / 255.f, l.color.b / 255.f, l.color.a / 255.f};
-	SetShaderValue(s, l.loc_color, color, SHADER_UNIFORM_VEC4);
+	PredatorData *data = (PredatorData*)arena_alloc(&arena, sizeof(PredatorData));
+	data->handle = -1;
+	data->attack_time = 1.f;
+	en->user_data = data;
+	return en;
 }
 
-void update_all_light_data(Shader s) {
-	for (int i = 0; i < MAX_LIGHTS; i++) {
-		update_light_data(s, i);	
+// :predator
+void en_predator_update(Entity* self) {
+	
+	PredatorData *data = (PredatorData*)self->user_data;
+	
+	if (data->handle == -1) {
+		while (data->handle == -1) {
+			ListEntity defense = get_all_with_prop(EP_ATTACKABLE, &temp_arena);
+			if(defense.count == 1) {
+				data->handle = defense.items[0].handle;
+				break;
+			} else {
+				int rnd_idx = GetRandomValue(0, defense.count - 1);
+				if (defense.items[rnd_idx].type == ET_THING) {continue;}
+				data->handle = defense.items[rnd_idx].handle;
+				break;
+			}
+		}
+	}
+
+	if (!state->entities[data->handle].valid) {
+		data->handle = -1;
+		return;
+	}
+
+	self->pos = Vector2MoveTowards(self->pos, state->entities[data->handle].pos, 60 * state->dt);
+
+	data->attack_time -= state->dt;
+	if (CheckCollisionRecs(en_box(*self), en_box(state->entities[data->handle])) && data->attack_time < 0) {
+		Entity *en = &state->entities[data->handle];
+		en->health -= 1;
+		data->attack_time = 1;
+		en->attacked = true;
+	}
+
+	if (self->health <= 0) {
+		state->win = true;
+		en_invalidate(self);
 	}
 }
 
-int add_light(Shader s, Vector2 position, float radius, Color color) {
-	int id = light_idx;
-
-	lights[id].pos = position;
-	lights[id].radius = radius;
-	lights[id].color = color;
-
-	lights[id].loc_pos = GetShaderLocation(s, TextFormat("lights[%i].pos", id));
-	lights[id].loc_radius = GetShaderLocation(s, TextFormat("lights[%i].radius", id));
-	lights[id].loc_color = GetShaderLocation(s, TextFormat("lights[%i].color", id));
-
-	update_light_data(s, id);
-
-	light_idx += 1;
-
-	return id;
+// :predator
+void en_predator_render(Entity self) {
+	push_layer(L_DEBUG_COL);
+	draw_texture_v2(PREDATOR, self.pos);
+	pop_layer();
 }
-
-enum Task {
-	TASK_NONE,
-	TASK_COLLECT,
-	TASK_POLLINATE,
-};
 
 struct WorkerData {
 	Task task;
-	Entity* flower;
+	int handle;
 };
 
 // :workers
@@ -771,31 +701,35 @@ Entity* en_worker(Vector2 pos, Task task) {
 
 	WorkerData* data = (WorkerData*)arena_alloc(&arena, sizeof(WorkerData));
 	data->task = task;
-
+	data->handle = -1;
 	en->user_data = data;
 
 	return en;
 }
 
+
 // :worker
 void en_worker_update(Entity* self) {
 
 	WorkerData* data = (WorkerData*)self->user_data;
+	ThingData* thing_data = (ThingData*)state->player->user_data;
 
-	if (data->flower == nullptr && fdata.flowers.count > 0) {
+	if (data->handle == -1 && fdata.flowers.count > 0) {
 		int rnd_idx = GetRandomValue(0, fdata.flowers.count - 1);
-		data->flower = &state->entities[fdata.flowers.items[rnd_idx].handle];
-		assert(!data->flower->was_selected && "Flower is selected!");
-		data->flower->was_selected = true;
+		data->handle = fdata.flowers.items[rnd_idx].handle;
+		state->entities[data->handle].was_selected = true;
 	}
 
-	if (data->flower != nullptr) {
+	if (data->handle != -1 && state->entities[data->handle].valid) {
 
-		self->pos = Vector2MoveTowards(self->pos, data->flower->pos, 100 * state->dt);
+		self->pos = Vector2MoveTowards(self->pos, state->entities[data->handle].pos, 100 * state->dt);
 
-		if (Vector2Equals(self->pos, data->flower->pos)) {
-			en_invalidate(data->flower);
+		if (Vector2Equals(self->pos, state->entities[data->handle].pos)) {
+			en_invalidate(&state->entities[data->handle]);
 			en_invalidate(self);
+			state->flower_cnt -= 1;
+			PlaySound(state->remove_flower);
+			thing_data->food_amt += GetRandomValue(2, 5);	
 		}
 	}
 }
@@ -803,20 +737,11 @@ void en_worker_update(Entity* self) {
 // :worker
 void en_worker_render(Entity self) {
 	push_layer(L_WORKER);
-	draw_quad(to_v4(en_box(self)), GOLD);
+	draw_texture_v2(WORKER_ICON, self.pos);
 	pop_layer();
 }
 
-// :thing
-struct ThingData {
-	ListEntity workers;
-	Task current_task;
-	float perform_task_time;
-	int food_amt;
-	int worker_amt;
-};
-
-#define PERFORM_TASK_TIME 1.2f
+#define PERFORM_TASK_TIME .8f
 #define WORKER_AMT 20
 #define START_FOOD_AMT 100
 
@@ -835,6 +760,9 @@ Entity* en_thing(Vector2 pos, Vector2 size) {
 	data->food_amt = START_FOOD_AMT;
 
 	en->user_data = data;
+	en->health = 100;
+
+	en_add_props(en, {EP_ATTACKABLE});
 
 	return en;
 }
@@ -842,25 +770,60 @@ Entity* en_thing(Vector2 pos, Vector2 size) {
 // :thing
 void en_thing_update(Entity* self) {
 
-	if(IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-		if (CheckCollisionPointRec(GetScreenToWorld2D(state->virtual_mouse, state->cam), en_box(*self))) {
-			state->show_thing_ui = true;
-		}
-	}
-
 	ThingData* data = (ThingData*)self->user_data;
 	
 	switch (data->current_task) {
+		case TASK_NONE:
+			break;
 		case TASK_COLLECT:
-			data->perform_task_time -= state->dt * state->dt_speed;
-			if (data->perform_task_time < 0 && fdata.flowers.count > 0) {
-				en_worker(en_center(*self), data->current_task);
-				data->perform_task_time = PERFORM_TASK_TIME;
+			if(data->worker_amt > 0) {
+				data->perform_task_time -= state->dt * state->dt_speed;
+				if (data->perform_task_time < 0 && fdata.flowers.count > 0) {
+					en_worker(en_center(*self), data->current_task);
+					data->perform_task_time = PERFORM_TASK_TIME;
+					data->worker_amt -= 1;
+					data->food_amt -= 1;
+				}
+			} else {
+				data->current_task = TASK_NONE;
+				data->worker_amt = data->last_worker_amt;
 			}
 			break;
+		case TASK_DEFENSE:
+		{
+			data->food_amt -= 200;
+			data->worker_amt -= 10;
+			Vector2 pos = v2(
+					GetRandomValue(-RENDER_SIZE.x/2, RENDER_SIZE.x/2),
+					GetRandomValue(-RENDER_SIZE.y/2, RENDER_SIZE.y/2)
+			);
+		
+			bool in_player = CheckCollisionPointRec(pos, to_rect(v4v2(self->pos, v2(48, 64))));
+			
+			en_defense(pos, v2(DEFENSE_BUILDING.z, DEFENSE_BUILDING.w));
+
+			data->current_task = TASK_NONE;
+		}
+		break;
+		case TASK_REPRODUCE:
+		{
+			data->food_amt -= 2 * (data->worker_amt / 2);
+			data->worker_amt += data->worker_amt / 2;
+			data->current_task = TASK_NONE;
+		}
+		break;
 	}
 
-	
+	if (self->health <= 0) {
+		state->lost = true;
+	}
+
+	if (self->attacked) {
+		ListEntity def = get_all_with_prop(EP_ATTACKABLE);
+		if (def.count == 1) {
+			state->lost = true;
+		}
+	}
 }
 
 // :thing
@@ -873,7 +836,7 @@ void en_thing_render(Entity self) {
 
 
 
-bool ui_btn(Vector2 pos, const char* text, float text_size) {
+bool ui_btn(Vector2 pos, const char* text, float text_size, bool can_click = true) {
 
 	Vector4 dest = v4zw(96, 32);
 	dest.x = pos.x;
@@ -900,67 +863,33 @@ bool ui_btn(Vector2 pos, const char* text, float text_size) {
 	draw_texture_v2({128, hover ? 240.f : 208.f, 96, 32}, pos);
 	draw_text(text_pos, text, text_size);
 
-	return clicked;
-}
-
-int main(void) {
-
-	// :raylib
-	SetTraceLogLevel(LOG_WARNING);
-	InitWindow(WINDOW_SIZE.x, WINDOW_SIZE.y, "ld56");
-	SetTargetFPS(60);
-	SetExitKey(KEY_Q);
-	
-	// :load
-	Texture2D atlas = LoadTexture("./res/atlas.png");
-	RenderTexture2D game_texture = LoadRenderTexture(RENDER_SIZE.x, RENDER_SIZE.y);
-	RenderTexture2D light_texture = LoadRenderTexture(RENDER_SIZE.x, RENDER_SIZE.y);
-	Shader light_shader = LoadShader(nullptr, "./res/light_frag.glsl");
-
-	// :init
-	renderer = (Renderer*)arena_alloc(&arena, sizeof(Renderer));
-	memset(renderer->layers, 0, sizeof(RenderLayer) * MAX_LAYERS);
-	renderer->layer_stack = {0};
-	renderer->current_layer = 0;
-	renderer->atlas = atlas;
-	
-	state = (State*)arena_alloc(&arena, sizeof(State));
-	memset(state->map, -1, sizeof(int) * (MAP_SIZE * MAP_SIZE));
-	memset(state->entities, 0, sizeof(Entity) * MAX_ENTITIES);
-	state->dt_speed = 1;	
-	state->cam = Camera2D{};
-	state->cam.zoom = 1.f;
-	state->cam.offset = RENDER_SIZE / v2of(2);
-
-	state->show_begin_message = true;
-
-	Vector2 player_size = v2(48, 64);
-	Vector2 player_pos = ZERO - (player_size / 2);
-	state->player = en_thing(player_pos, player_size);
-
-	bool lights_on = false;
-	add_light(light_shader, ZERO, PLAYER_LIGHT_RADIUS * TILE_SIZE, {255, 200, 37, 255});
-
-	assert(renderer != NULL && "arena returned null");
-
-
-	float flower_spawn_time = 2.f;
-	
-	for (int i = 0; i < 256; i++) {
-		Vector2 pos = v2(
-			GetRandomValue(-RENDER_SIZE.x/2, RENDER_SIZE.x/2),
-			GetRandomValue(-RENDER_SIZE.y/2, RENDER_SIZE.y/2)
-		);
-			
-		bool in_player = CheckCollisionPointRec(pos, to_rect(v4v2(player_pos, v2(48, 64))));
-		bool out_of_bounds = pos.x + 16 > RENDER_SIZE.x / 2 || pos.x < -RENDER_SIZE.x / 2 || pos.y + 16 > RENDER_SIZE.x / 2 || pos.y < -RENDER_SIZE.x / 2;
-		if(!in_player && !out_of_bounds) {
-			en_flower(pos);
-		}
+	if(!can_click) {
+		draw_quad(v4(pos.x, pos.y, 96, 32), ColorAlpha(GRAY, .8));
 	}
 
-	// :loop
-	while(!WindowShouldClose()) {
+	return clicked && can_click;
+}
+
+Music loop_1;
+Music predator_music;
+Sound ui_click;
+Sound hover_sound;
+Music music;
+float volume = 0;
+float flower_spawn_time = 0.f;
+bool in_predator = false;
+Vector2 player_pos;
+RenderTexture2D game_texture;
+RenderTexture2D light_texture;
+RenderTexture2D ui_texture;
+
+void update_frame() {
+	UpdateMusicStream(music);
+		
+		if (volume < .7) {
+			volume = fminf(volume + 0.2 * GetFrameTime(), .7);
+			SetMusicVolume(music, volume);
+		}
 
 		state->dt = GetFrameTime();
 		state->dt *= state->dt_speed;
@@ -976,27 +905,50 @@ int main(void) {
 		{
 			if (state->show_begin_message && IsKeyPressed(KEY_ENTER)) {
 				state->show_begin_message = false;
+				state->show_thing_ui = true;
+			}
+
+			if (state->thing_data->current_task == TASK_NONE && !state->show_begin_message && !in_predator) {
+				state->show_thing_ui = true;
+				state->dt_speed = 1;
+			}
+
+			if (!state->show_thing_ui && !state->show_begin_message) {
+				state->time_for_predator -= state->dt * state->dt_speed;
+			}
+
+			if (state->time_for_predator <= 0) {
+				if (!in_predator) {
+					state->dt_speed = 1;
+					state->predator = en_predator(v2(0, -RENDER_SIZE.y / 2), v2(PREDATOR.z, PREDATOR.w));
+					StopMusicStream(music);
+					music = predator_music;
+					volume = 0.f;
+					PlayMusicStream(music);
+					in_predator =  true;
+				}
 			}
 
 			// :spawn
-			//{
-			//	flower_spawn_time -= state->dt * state->dt_speed;
-			//	if (flower_spawn_time < 0) {
-			//		Vector2 pos = v2(
-			//				GetRandomValue(-RENDER_SIZE.x/2, RENDER_SIZE.x/2),
-			//				GetRandomValue(-RENDER_SIZE.y/2, RENDER_SIZE.y/2)
-			//		);
+			{
+				flower_spawn_time -= state->dt * state->dt_speed;
+				if (flower_spawn_time < 0 && state->flower_cnt < 300) {
+					Vector2 pos = v2(
+							GetRandomValue(-RENDER_SIZE.x/2, RENDER_SIZE.x/2),
+							GetRandomValue(-RENDER_SIZE.y/2, RENDER_SIZE.y/2)
+					);
 		
-			//		bool in_player = CheckCollisionPointRec(pos, to_rect(v4v2(player_pos, v2(48, 64))));
-			//		bool out_of_bounds = pos.x + 16 > RENDER_SIZE.x / 2 || pos.x < -RENDER_SIZE.x / 2 || pos.y + 16 > RENDER_SIZE.x / 2 || pos.y < -RENDER_SIZE.x / 2;
-			//		if(!in_player && !out_of_bounds) {
-			//			en_flower(pos);
-			//		}
+					bool in_player = CheckCollisionPointRec(pos, to_rect(v4v2(player_pos, v2(48, 64))));
+					bool out_of_bounds = pos.x + 16 > RENDER_SIZE.x / 2 || pos.x < -RENDER_SIZE.x / 2 || pos.y + 16 > RENDER_SIZE.x / 2 || pos.y < -RENDER_SIZE.x / 2;
+					if(!in_player && !out_of_bounds) {
+						en_flower(pos);
+						state->flower_cnt += 1;
+					}
 
 
-			//		flower_spawn_time = 2.f;
-			//	}
-			//}
+					flower_spawn_time = 2.f;
+				}
+			}
 
 			// :gather unselected flowers
 			{
@@ -1009,13 +961,13 @@ int main(void) {
 
 			// :debug
 			{
-				if (IsKeyPressed(KEY_L)) {
-					lights_on = !lights_on;
-				} else if(IsKeyPressed(KEY_K)) {
+				if(IsKeyPressed(KEY_K)) {
 					state->dt_speed += 1;
 				} else if(IsKeyPressed(KEY_J)) {
 					state->dt_speed -= 1;
 				}
+
+				state->dt_speed = Clamp(state->dt_speed, 1, 10);
 			}
 
 			for(int i = 0; i < MAX_ENTITIES; i++) {
@@ -1023,15 +975,22 @@ int main(void) {
 				if (!en->valid) { continue; };
 				switch (en->type) {
 					case ET_NONE:
+					case ET_FLOWER:
 						break;
-					case ET_COLLECTABLE:
-						en_collectable_update(en);
+					case ET_DEFENSE:
+						en_defense_update(en);
 						break;
 					case ET_THING:
 						en_thing_update(en);
 						break;
 					case ET_WORKER:
 						en_worker_update(en);
+						break;
+					case ET_PREDATOR:
+						en_predator_update(en);
+						break;
+					case ET_FIREBALL:
+						en_fireball_update(en);
 						break;
 				}
 			}
@@ -1054,8 +1013,8 @@ int main(void) {
 							switch (en.type) {
 								case ET_NONE:
 									break;
-								case ET_COLLECTABLE:
-									en_collectable_render(en);
+								case ET_DEFENSE:
+									en_defense_render(en);
 									break;
 								case ET_FLOWER:
 									en_flower_render(en);
@@ -1065,6 +1024,12 @@ int main(void) {
 									break;
 								case ET_WORKER:
 									en_worker_render(en);
+									break;
+								case ET_PREDATOR:
+									en_predator_render(en);
+									break;
+								case ET_FIREBALL:
+									en_fireball_render(en);
 									break;
 							}
 						}
@@ -1083,10 +1048,54 @@ int main(void) {
 				}
 				EndMode2D();
 
+							}
+			EndTextureMode();
+		}
+
+		
+		
+		// :light_texture
+		{
+			BeginTextureMode(light_texture);
+			{
+				ClearBackground(BLACK);
+				
+
+					DrawTexturePro(
+							game_texture.texture, 
+							{0, 0, float(game_texture.texture.width)
+							, float(game_texture.texture.height)},
+							{0, 0, RENDER_SIZE.x, RENDER_SIZE.y},
+							ZERO,
+							0, 
+							WHITE
+					);
+			}
+			EndTextureMode();
+		}
+		
+		
+		
+		BeginTextureMode(ui_texture);
+		{
+			ClearBackground(BLANK);
+				DrawTexturePro(
+							light_texture.texture, 
+							{0, 0, float(light_texture.texture.width),
+							float(light_texture.texture.height)},
+							{0, 0, RENDER_SIZE.x, RENDER_SIZE.y},
+							ZERO,
+							0, 
+							WHITE
+				);
+
 				// :ui
 				{
 					if (state->show_thing_ui) {
-						Vector4 sprite = v4(528, 0, 304, 224);
+
+						Vector4 tasks = v4(0, 416, 446, 224);
+							
+						Vector4 sprite = v4(0, 416, 576, 224);
 						Vector4 dest = v4zw(sprite.z, sprite.w);
 						dest.x = (RENDER_SIZE.x - dest.z) * .5f;
 						dest.y = (RENDER_SIZE.y - dest.w) * .5f;
@@ -1094,11 +1103,198 @@ int main(void) {
 						float size = MeasureText("Perform task:", 20);
 						Vector4 title_dest = v4zw(size, 20);
 						start_of(dest, &title_dest);
-						center(dest, &title_dest, 0);
 						pad(&title_dest, TOP, 10);
+						pad(&title_dest, LEFT, 10);
 						
 						draw_texture_v2(sprite, xyv4(dest));
 						draw_text(xyv4(title_dest), "Perform task:", 20);
+
+
+						const char* task_name[3] = {
+							"Collect", "Build Defense", "Reproduce",
+						};
+
+						static int selected = -1;
+						static int hover = 0;
+						for(int i = 0; i < 3; i++) {
+							Vector4 collect = v4zw(132, 132);
+							start_of(dest, &collect);
+							center(dest, &collect, 1);
+							pad(&collect, LEFT, 10);
+							collect.x += i * (collect.z + 10);
+
+							if (CheckCollisionPointRec(state->virtual_mouse, to_rect(collect))) {
+								collect = grow(collect, 5);
+								if (hover != i)
+									PlaySound(hover_sound);
+								hover = i;
+								if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+									selected = i;
+									PlaySound(ui_click);
+								}
+							}
+							
+							Vector4 text_dest = v4zw(float(MeasureText(task_name[i], 10.f)), 10.f);
+							start_of(collect, &text_dest);
+							center(collect, &text_dest, 0);
+							center(collect, &text_dest, 1);
+
+							Vector4 back = {528, selected == i ? 132.f : 0.f, 132, 132};
+							draw_texture_v2(back, xyv4(collect));
+							draw_text(xyv4(text_dest), task_name[i], 10);
+						}
+						
+						Vector4 confirm = v4zw(100, 25);
+						start_of(dest, &confirm);
+						bottom_of(dest, &confirm);
+						center(tasks, &confirm, 0);
+						pad(&confirm, BOTTOM, 10);
+
+						bool can_click = true;
+						if (selected == 1) {
+							can_click = state->thing_data->food_amt - 200 > 0 && state->thing_data->worker_amt - 10 > 0;	
+						} else if(selected == 2) {
+							can_click = state->thing_data->food_amt - state->thing_data->worker_amt > 0; 
+						}
+
+						if(ui_btn(xyv4(confirm), "Confirm", 10, can_click)) {
+							PlaySound(ui_click);
+							ThingData* data = (ThingData*)state->player->user_data;
+							switch(selected) {
+								case 0:
+									data->current_task = TASK_COLLECT;
+									state->show_thing_ui = false;
+									break;
+								case 1:
+									data->current_task = TASK_DEFENSE;
+									state->show_thing_ui = false;
+									break;
+								case 2:
+									data->current_task = TASK_REPRODUCE;
+							}
+							data->last_worker_amt = data->worker_amt;
+						}
+
+						Vector4 other = {dest.x + 447, dest.y, 128, dest.w};
+						int to_switch = selected != hover ? hover : selected;
+						switch (to_switch) {
+							case 0: // COLLECT
+							{
+								Vector4 title = v4zw(other.z, 10);
+								start_of(other, &title);
+								pad(&title, LEFT, 10);
+								pad(&title, TOP, 10);
+
+								draw_text(xyv4(title), "Info:", 10);
+
+								Vector4 food_icon_dest = v4zw(32, 32);
+								start_of(other, &food_icon_dest);
+								below(title, &food_icon_dest);
+								center(other, &food_icon_dest, 0);
+								pad(&food_icon_dest, TOP, 3);
+								
+								draw_texture_v2(FOOD_ICON, xyv4(food_icon_dest));
+
+								const char* food_cost_str = TextFormat("-%d/+~%d", state->thing_data->worker_amt, state->thing_data->worker_amt * 4);
+								float size = MeasureText(food_cost_str, 10);
+								Vector4 food_cost = v4zw(size, 10);
+								start_of(other, &food_cost);
+								below(food_icon_dest, &food_cost);
+								center(other, &food_cost, 0);
+
+								draw_text(xyv4(food_cost), food_cost_str, 10);
+
+							}
+							break;
+							case 1: // Defense
+							{
+								Vector4 title = v4zw(other.z, 10);
+								start_of(other, &title);
+								pad(&title, LEFT, 10);
+								pad(&title, TOP, 10);
+
+								draw_text(xyv4(title), "Info:", 10);
+
+								Vector4 food_icon_dest = v4zw(32, 32);
+								start_of(other, &food_icon_dest);
+								below(title, &food_icon_dest);
+								center(other, &food_icon_dest, 0);
+								pad(&food_icon_dest, TOP, 3);
+								
+								draw_texture_v2(FOOD_ICON, xyv4(food_icon_dest));
+
+								const char* food_cost_str = TextFormat("-%d", 200);
+								float size = MeasureText(food_cost_str, 10);
+								Vector4 food_cost = v4zw(size, 10);
+								start_of(other, &food_cost);
+								below(food_icon_dest, &food_cost);
+								center(other, &food_cost, 0);
+
+								draw_text(xyv4(food_cost), food_cost_str, 10);
+								
+								Vector4 worker_icon_dest = v4zw(32, 32);
+								start_of(other, &worker_icon_dest);
+								below(food_cost, &worker_icon_dest);
+								center(other, &worker_icon_dest, 0);
+								pad(&worker_icon_dest, TOP, 3);
+							
+								draw_texture_v2(WORKER_ICON, xyv4(worker_icon_dest));
+
+								const char* worker_cost_str = TextFormat("-%d", 10);
+								size = MeasureText(worker_cost_str, 10);
+								Vector4 worker_cost = v4zw(size, 10);
+								start_of(other, &worker_cost);
+								below(worker_icon_dest, &worker_cost);
+								center(other, &worker_cost, 0);
+
+								draw_text(xyv4(worker_cost), worker_cost_str, 10);
+							}
+							break;
+							case 2:
+							{
+								Vector4 title = v4zw(other.z, 10);
+								start_of(other, &title);
+								pad(&title, LEFT, 10);
+								pad(&title, TOP, 10);
+
+								draw_text(xyv4(title), "Info:", 10);
+
+								Vector4 food_icon_dest = v4zw(32, 32);
+								start_of(other, &food_icon_dest);
+								below(title, &food_icon_dest);
+								center(other, &food_icon_dest, 0);
+								pad(&food_icon_dest, TOP, 3);
+								
+								draw_texture_v2(FOOD_ICON, xyv4(food_icon_dest));
+
+								const char* food_cost_str = TextFormat("-%d", state->thing_data->worker_amt);
+								float size = MeasureText(food_cost_str, 10);
+								Vector4 food_cost = v4zw(size, 10);
+								start_of(other, &food_cost);
+								below(food_icon_dest, &food_cost);
+								center(other, &food_cost, 0);
+
+								draw_text(xyv4(food_cost), food_cost_str, 10);
+								
+								Vector4 worker_icon_dest = v4zw(32, 32);
+								start_of(other, &worker_icon_dest);
+								below(food_cost, &worker_icon_dest);
+								center(other, &worker_icon_dest, 0);
+								pad(&worker_icon_dest, TOP, 3);
+							
+								draw_texture_v2(WORKER_ICON, xyv4(worker_icon_dest));
+
+								const char* worker_cost_str = TextFormat("+%d", state->thing_data->worker_amt / 2);
+								size = MeasureText(worker_cost_str, 10);
+								Vector4 worker_cost = v4zw(size, 10);
+								start_of(other, &worker_cost);
+								below(worker_icon_dest, &worker_cost);
+								center(other, &worker_cost, 0);
+
+								draw_text(xyv4(worker_cost), worker_cost_str, 10);
+							}
+							break;
+						}
 					}
 				}
 
@@ -1106,7 +1302,7 @@ int main(void) {
 				{
 					push_layer(L_HUD);
 					{
-						Vector4 food_icon = {144, 160, 32, 32};
+						Vector4 dest = v4(0, 0, RENDER_SIZE.x, RENDER_SIZE.y);
 						Vector4 food_dest = v4(10, 10, 32, 32);
 
 						ThingData data = *(ThingData*)state->player->user_data;
@@ -1128,10 +1324,53 @@ int main(void) {
 						center(workers_dest, &worker_amt, 1);
 						pad(&worker_amt, LEFT, 10);
 
-						draw_texture_v2(food_icon, xyv4(food_dest));
+						draw_texture_v2(FOOD_ICON, xyv4(food_dest));
 						draw_text(xyv4(food_amt), foodstr, 20);
-						draw_quad(workers_dest, GOLD);
+						draw_texture_v2(WORKER_ICON, xyv4(workers_dest));
 						draw_text(xyv4(worker_amt), workerstr, 20);
+
+						if (state->thing_data->current_task != TASK_NONE && state->time_for_predator > 30) {
+							Vector4 skip_btn = v4zw(90, 32);
+							bottom_of(dest, &skip_btn);
+							center(dest, &skip_btn, 0);
+							pad(&skip_btn, BOTTOM, 10);
+
+							if (ui_btn(xyv4(skip_btn), "Skip..", 10)) {
+								PlaySound(ui_click);
+								state->dt_speed = 10;
+							}
+							
+						}
+
+						if(state->time_for_predator > 0) {
+						Time t = seconds_to_hm(state->time_for_predator);
+
+						char buf[1024] = {0};
+						std::snprintf(buf, 1024, "%02d:%02d:%02d", t.h, t.m, t.s);
+
+						Vector4 predators_time = v4zw((float)MeasureText(buf, 20), 20);
+						end_of(dest, &predators_time);
+						pad(&predators_time, TOP, 10);
+						pad(&predators_time, RIGHT, predators_time.z + 10);
+
+						Color color = WHITE;
+						if (state->show_thing_ui)
+							color = ColorAlpha(WHITE, ((sinf(GetTime() * 3) * .5) + .5));
+
+						draw_text(xyv4(predators_time),buf, 20, color);
+						} else if(state->predator->health > 0) {
+							char buf[1024] = {0};
+							std::snprintf(buf, 1024, "%04d/%d", state->predator->health, PREDATOR_HP);
+							
+							Vector4 predator_health = v4zw((float)MeasureText(buf, 20), 20);
+							center(dest, &predator_health, 0);
+							pad(&predator_health, TOP, 10);
+
+							draw_text(xyv4(predator_health), buf, 20);
+					
+						}
+
+						
 					}
 					pop_layer();
 				}
@@ -1162,7 +1401,7 @@ int main(void) {
 							"given the task of managing this colony.",
 							"Try keeping it alive by managing ants.",
 							"They can collect food, build defenses,",
-							"pollinate and reproduce.",
+							"and reproduce.",
 							"",
 							"Be aware the colony can't run out of",
 							"food, or the ant's will leave.",
@@ -1178,7 +1417,7 @@ int main(void) {
 						draw_texture_v2(sprite, xyv4(dest));
 						draw_text(xyv4(title_dest), "Welcome", 20);
 
-						float new_y = 0.f;
+						float last_y = 0.f;
 						for (int i = 0; i < message_len; i++) {
 							float message_sz = MeasureText(messages[i], 10);
 							Vector4 message_dest = v4zw(message_sz, 10);
@@ -1188,49 +1427,85 @@ int main(void) {
 							center(dest, &message_dest, 0);
 							message_dest.y += i * message_dest.w;
 							draw_text(xyv4(message_dest), messages[i], 10);
+							last_y = message_dest.y + message_dest.w;
 						}
+						
+						size = MeasureText("Icons:", 20);
+						Vector4 icon_dest = v4zw(size, 20);
+						start_of(dest, &icon_dest);
+						icon_dest.y = last_y;
+						center(dest, &icon_dest, 0);
+						pad(&icon_dest, TOP, 10);
 
+						draw_text(xyv4(icon_dest), "Icons:", 20);
+
+						Vector4 icon_food = v4zw(32, 32);
+						start_of(dest, &icon_food);
+						below(icon_dest, &icon_food);
+						pad(&icon_food, LEFT, 10);
+
+						draw_texture_v2(FOOD_ICON, xyv4(icon_food));
+						
+						Vector4 icon_food_label = v4zw(float(MeasureText("Food", 10)), 10);
+						end_of(icon_food, &icon_food_label);
+						center(icon_food, &icon_food_label, 1);
+
+						draw_text(xyv4(icon_food_label), "Food", 10);
+
+						Vector4 icon_worker = v4zw(32, 32);
+						end_of(dest, &icon_worker);
+						below(icon_dest, &icon_worker);
+						pad(&icon_worker, RIGHT, icon_worker.z + 10);
+
+						draw_texture_v2(WORKER_ICON, xyv4(icon_worker));
+
+						Vector4 icon_worker_label = v4zw((float)MeasureText("Ant", 10), 10);
+						start_of(icon_worker, &icon_worker_label);
+						pad(&icon_worker_label, RIGHT, icon_worker_label.z);
+						center(icon_worker, &icon_worker_label, 1);
+
+						draw_text(xyv4(icon_worker_label), "Ant", 10);
+						
 						if (ui_btn(xyv4(ok_btn), "Start", 10)) {
 							state->show_begin_message = false;
+							PlaySound(ui_click);
 							state->show_thing_ui = true;
 						}
-					}
 				}
-
-				flush_renderer();
 			}
-			EndTextureMode();
-		}
-		
-		// :light_texture
-		{
-			BeginTextureMode(light_texture);
-			{
-				ClearBackground(BLACK);
-				
-				BeginShaderMode(light_shader);
-				{
-					update_all_light_data(light_shader);	
 
-					DrawTexturePro(
-							game_texture.texture, 
-							{0, 0, float(game_texture.texture.width), float(game_texture.texture.height)},
-							{0, 0, RENDER_SIZE.x, RENDER_SIZE.y},
-							ZERO,
-							0, 
-							WHITE
-					);
-				}
-				EndShaderMode();
-			}
-			EndTextureMode();
-		}
-		
-		RenderTexture2D final = game_texture;
-		if(lights_on) {
-			final = light_texture;
-		}
+			if (state->lost) {
+				StopMusicStream(music);
 
+				Vector4 dest =  v4v2(ZERO, RENDER_SIZE);
+				draw_quad(dest, ColorAlpha(BLACK, .5));
+
+				Vector4 text = v4zw(float(MeasureText("You Lost...", 40)), 40);
+				center(dest, &text, 0);
+				center(dest, &text, 1);
+
+				draw_text(xyv4(text), "You Lost...", 40);
+			 } else if(state->win) {
+			 	StopMusicStream(music);
+
+				Vector4 dest =  v4v2(ZERO, RENDER_SIZE);
+				draw_quad(dest, ColorAlpha(BLACK, .5));
+
+				Vector4 text = v4zw(float(MeasureText("You Win!!!", 40)), 40);
+				center(dest, &text, 0);
+				center(dest, &text, 1);
+
+				draw_text(xyv4(text), "You Win...", 40);
+			 }
+			
+			flush_renderer();
+
+		}
+		EndTextureMode();
+
+		RenderTexture2D final = ui_texture;
+		
+		
 		BeginDrawing();
 		{
 			ClearBackground(BLACK);
@@ -1254,7 +1529,87 @@ int main(void) {
 			DrawFPS(10, WINDOW_SIZE.y - 20);
 		}
 		EndDrawing();
+
+}
+
+int main(void) {
+
+	// :raylib
+	SetTraceLogLevel(LOG_WARNING);
+	InitWindow(WINDOW_SIZE.x, WINDOW_SIZE.y, "ld56");
+	InitAudioDevice();
+	SetTargetFPS(60);
+	SetExitKey(KEY_Q);
+	
+	// :load
+	Texture2D atlas = LoadTexture("./res/atlas.png");
+	game_texture = LoadRenderTexture(RENDER_SIZE.x, RENDER_SIZE.y);
+	light_texture = LoadRenderTexture(RENDER_SIZE.x, RENDER_SIZE.y);
+	ui_texture = LoadRenderTexture(RENDER_SIZE.x, RENDER_SIZE.y);
+	ui_click = LoadSound("./res/btn_click.wav");
+	loop_1 = LoadMusicStream("./res/loop_1.ogg");
+	predator_music = LoadMusicStream("./res/predator.ogg");
+	Sound remove_flower = LoadSound("./res/remove_flower.wav");
+	hover_sound = LoadSound("./res/hover.wav");
+	Sound shoot = LoadSound("./res/shoot.wav");
+	Sound died = LoadSound("./res/died.wav");
+
+	// :init
+	renderer = (Renderer*)arena_alloc(&arena, sizeof(Renderer));
+	memset(renderer->layers, 0, sizeof(RenderLayer) * MAX_LAYERS);
+	renderer->layer_stack = {0};
+	renderer->current_layer = 0;
+	renderer->atlas = atlas;
+	
+	state = (State*)arena_alloc(&arena, sizeof(State));
+	memset(state->entities, 0, sizeof(Entity) * MAX_ENTITIES);
+	state->dt_speed = 1;	
+	state->cam = Camera2D{};
+	state->cam.zoom = 1.f;
+	state->cam.offset = RENDER_SIZE / v2of(2);
+	state->show_begin_message = true;
+	state->time_for_predator = 600;
+	state->remove_flower = remove_flower;
+	state->shoot = shoot;
+	state->died = died;
+	state->lost = false;
+	state->win = false;
+
+	Vector2 player_size = v2(48, 64);
+	player_pos = ZERO - (player_size / 2);
+	state->player = en_thing(player_pos, player_size);
+	state->thing_data = (ThingData*)state->player->user_data; 
+
+	assert(renderer != NULL && "arena returned null");
+
+	flower_spawn_time = .8;
+	
+	for (int i = 0; i < 256; i++) {
+		Vector2 pos = v2(
+			GetRandomValue(-RENDER_SIZE.x/2, RENDER_SIZE.x/2),
+			GetRandomValue(-RENDER_SIZE.y/2, RENDER_SIZE.y/2)
+		);
+			
+		bool in_player = CheckCollisionPointRec(pos, to_rect(v4v2(player_pos, v2(48, 64))));
+		bool out_of_bounds = pos.x + 16 > RENDER_SIZE.x / 2 || pos.x < -RENDER_SIZE.x / 2 || pos.y + 16 > RENDER_SIZE.x / 2 || pos.y < -RENDER_SIZE.x / 2;
+		if(!in_player && !out_of_bounds) {
+			en_flower(pos);
+		}
 	}
+	state->flower_cnt = 256;
+
+	Music music = loop_1;
+	PlayMusicStream(music);
+
+	float volume = 0;
+	bool in_predator = false;
+#if defined(PLATFORM_WEB)
+    emscripten_set_main_loop(update_frame, 60, 1);
+#else
+    while (!WindowShouldClose()) {
+    	update_frame();
+	}
+#endif
 
 	CloseWindow();
 
