@@ -6,7 +6,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
-#include <iterator>
 #include <map>
 #include <sys/stat.h>
 
@@ -16,11 +15,14 @@
 #include <raylib.h>
 #include <raymath.h>
 
-#define CUTE_TILED_IMPLEMENTATION
-#include <cute_tiled.h>
 
 // :sprite
 const Vector4 PLAYER = {1008, 1008, 16, 16};
+const Vector4 BIRD = {112, 144, 16, 16};
+const Vector4 FLOWER_0 = {208, 0, 16, 16};
+const Vector4 FLOWER_SPOT = {208, 16, 16, 16};
+const Vector4 THING = {208, 48, 48, 64};
+const Vector4 THING_SPOT = {192, 112, 80, 48};
 
 std::map<int, Vector4> tiles_sprites = {
 	{0, {0, 0, 16, 16}},
@@ -40,8 +42,8 @@ Arena temp_arena = {};
 #define v2of(val) v2(val, val)
 #define v4(x, y, z, w) (Vector4){x, y, z, w}
 #define v4v2(a, b) Vector4{a.x, a.y, b.x, b.y}
-//#define v4xy_v2(v) Vector4{(v).x, (v).y, 0, 0}
-#define xy_v4(v) Vector2{v.x, v.y}
+#define v4zw(z, w) Vector4{0, 0, z, w}
+#define xyv4(v) v2(v.x, v.y)
 #define to_rect(_v4) (Rectangle){_v4.x, _v4.y, _v4.z, _v4.w}
 #define to_v2(v) v2(v.x, v.y)
 #define to_v4(r) v4(r.x, r.y, r.width, r.height)
@@ -50,17 +52,57 @@ Arena temp_arena = {};
 
 typedef void* rawptr;
 
-void pop_tiles() {
-	for(int x = 0; x < 64; x++) {
-		for(int y = 0; y < 64; y++) {
-			tiles_sprites[y * 64 + x] = {
-				float(x) * TILE_SIZE,
-				float(y) * TILE_SIZE,
-				TILE_SIZE,
-				TILE_SIZE,
-			};	
-		}
+void start_of(Vector4 where, Vector4* it) {
+	it->x = where.x;
+	it->y = where.y;
+}
+
+void end_of(Vector4 where, Vector4* it) {
+	it->x = where.x + where.z;
+	it->y = where.y;
+}
+
+void bottom_of(Vector4 where, Vector4* it) {
+	it->y = where.y + where.w - it->w;
+}
+
+void center(Vector4 where, Vector4* it, int axis) {
+	switch (axis) {
+		case 0:
+			it->x += (where.z - it->z) * 0.5f;
+			break;
+		case 1:
+			it->y += (where.w - it->w) * .5f;
 	}
+}
+
+enum Side {
+	TOP,
+	BOTTOM,
+	LEFT,
+	RIGHT,
+};
+
+void pad(Vector4* it, Side side, float amt) {
+	switch(side) {
+		case TOP:
+			it->y += amt;
+			break;
+		case BOTTOM:
+			it->y -= amt;
+			break;
+		case LEFT:
+			it->x += amt;
+			break;
+	}
+}
+
+void below(Vector4 where, Vector4* it) {
+	it->y = where.y + where.w;
+}
+
+float scale(float xMax, float y, float yMax) {
+	return xMax * (y / yMax);
 }
 
 int signd(int x) {
@@ -94,6 +136,10 @@ const Vector2 operator+(const Vector2& a, const Vector2& b) {
 	return Vector2Add(a, b);
 }
 
+const Vector2 operator-(const Vector2& a, const Vector2& b) {
+	return Vector2Subtract(a, b);
+}
+
 const Vector2 operator*(const Vector2& a, const float b) {
 	return Vector2Multiply(a, {b, b});
 }
@@ -118,7 +164,9 @@ typedef enum DrawObjType {
 	NONE,
 	DRAW_OBJ_QUAD,
 	DRAW_OBJ_TEXTURE,
+	DRAW_OBJ_TEXTURE_PRO,
 	DRAW_QUAD_LINES,
+	DRAW_OBJ_TEXT,
 } DrawObjType;
 
 struct DrawObj {
@@ -127,6 +175,9 @@ struct DrawObj {
 	Vector4 dest;
 	Color tint;
 	float line_tick;
+	Texture2D tex;
+	const char* text;
+	float text_size;
 };
 
 struct ListDrawObj {
@@ -175,7 +226,18 @@ void pop_layer() {
 }
 
 void renderer_add(DrawObj obj) {
-	arena_da_append(&arena, &renderer->layers[renderer->current_layer].objs, obj);
+	RenderLayer *layer = &renderer->layers[renderer->current_layer];
+	arena_da_append(&arena, &layer->objs, obj);
+}
+
+void draw_text(Vector2 dest, const char* text, float text_size, Color tint = WHITE) {
+	renderer_add({
+		.type = DRAW_OBJ_TEXT,
+		.dest = v4(dest.x, dest.y, 0, 0),
+		.tint = tint,
+		.text = text,
+		.text_size = text_size,
+	});
 }
 
 void draw_quad(Vector4 dest, Color tint = WHITE) {
@@ -184,9 +246,7 @@ void draw_quad(Vector4 dest, Color tint = WHITE) {
 		.dest = dest,
 		.tint = tint,
 	});
-	
 }
-
 
 void draw_quad_lines(Vector4 dest, float line_tick = 1.f, Color tint = WHITE) {
 	renderer_add({
@@ -206,11 +266,21 @@ void draw_texture_v2(Vector4 src, Vector2 pos, Color tint = WHITE) {
 	});
 }
 
+void draw_texture_pro(Texture2D texture, Vector4 src, Vector4 dest, Color tint = WHITE) {
+	renderer_add({
+		.type = DRAW_OBJ_TEXTURE_PRO,
+		.src = src,
+		.dest = dest,
+		.tint = tint,
+		.tex = texture,
+	});	
+}
+
 void flush_renderer() {
 	for(int i = 0; i < MAX_LAYERS; i++) {
 		RenderLayer* layer = &renderer->layers[i];
-		for (int i = 0; i < layer->objs.count; i++) {
-			DrawObj it = layer->objs.items[i];
+		for (int j = 0; j < layer->objs.count; j++) {
+			DrawObj it = layer->objs.items[j];
 			switch (it.type) {
 				case NONE:
 					break;
@@ -223,10 +293,17 @@ void flush_renderer() {
 				case DRAW_QUAD_LINES:
 					DrawRectangleLinesEx(to_rect(it.dest), it.line_tick, it.tint);
 					break;
+				case DRAW_OBJ_TEXTURE_PRO:
+					DrawTexturePro(it.tex, to_rect(it.src), to_rect(it.dest), ZERO, 0, it.tint);
+					break;
+				case DRAW_OBJ_TEXT:
+					DrawText(it.text, (int)it.dest.x, (int)it.dest.y, (int)it.text_size, it.tint);
+					break;
 			}	
 		}
 		layer->objs.count = 0;
 	}
+	assert(renderer->layer_stack.count == 0 && "unclosed layers!");
 }
 // ;renderer
 
@@ -234,6 +311,7 @@ void flush_renderer() {
 
 enum EntityId {
 	EID_NONE,
+	EID_BIRD,
 };
 
 enum EntityType {
@@ -241,6 +319,10 @@ enum EntityType {
 	ET_COLLECTABLE,
 	ET_MOVING_PLAT,
 	ET_DOOR,
+	ET_FLOWER,
+	ET_THING,
+	ET_WORKER,
+	// :type
 };
 
 enum EntityProp {
@@ -267,6 +349,8 @@ struct Entity {
 	rawptr user_data;
 	float facing;
 	Entity* riding;
+	bool trigger;
+	bool was_selected;
 };
 
 void en_add_props(Entity* entity, std::initializer_list<EntityProp> props) {
@@ -297,11 +381,21 @@ Rectangle en_box(Entity en) {
 	return rv2(en.pos, en.size);
 }
 
+Vector2 en_center(Entity en) {
+	return {en.pos.x + en.size.x / 2, en.pos.y + en.size.y / 2};
+}
+
+void en_invalidate(Entity* en) {
+	memset(en, 0, sizeof(Entity));	
+}
+
 // ;entity
 
 // :data
 #define MAP_SIZE 100
 #define MAX_ENTITIES 1024
+#define MAX_LIGHTS 1
+#define PLAYER_LIGHT_RADIUS 20
 
 struct iv2 {
 	int x, y;
@@ -321,9 +415,25 @@ Vector2 to_render_pos(WorldPos pos) {
 struct State {
 	int map[MAP_SIZE*MAP_SIZE];
 	Entity entities[MAX_ENTITIES];
-	Entity* player;	
+	Entity* player;
+	Vector2 virtual_mouse;
+	Camera2D cam;
+	bool show_thing_ui;
+	float dt;
+	float dt_speed;
+	bool show_begin_message;
 };
 State *state = NULL;
+
+struct ListEntity {
+	Entity* items;
+	int count;
+	int capacity;
+};
+struct FrameData {
+	ListEntity flowers;
+};
+FrameData fdata = {};
 
 Entity* new_en() {
 	for(int i = 0; i < MAX_ENTITIES; i++) {
@@ -340,11 +450,7 @@ int get_tile(iv2 pos) {
 	return state->map[pos.y * MAP_SIZE + pos.x];
 }
 
-struct ListEntity {
-	Entity* items;
-	int count;
-	int capacity;
-};
+
 
 ListEntity get_all_with_prop(EntityProp prop, Arena* allocator = &arena) {
 	ListEntity list = {};
@@ -386,7 +492,7 @@ typedef bool(*on_collide)(Entity*);
 				if (callback) {
 					callback(e);
 				}
-                if (e->last_collided && !en_has_prop(*e->last_collided, EP_COLLIDABLE)) {
+                if (e->last_collided && e->last_collided->trigger) {
                     e->pos.x += sign;
                     move -= sign;
                 } else {
@@ -411,13 +517,10 @@ void actor_move_y(ListEntity collidables, Entity *e, float amount, on_collide ca
 				if (callback) {
 					callback(e);
 				}
-                if (e->last_collided && !en_has_prop(*e->last_collided, EP_COLLIDABLE)) {
+                if (e->last_collided && e->last_collided->trigger) {
                     e->pos.y += sign;
                     move -= sign;
                 } else {
-                    if (e->vel.y > 0) {
-                        e->grounded = true;
-                    }
                     e->vel.y = 0;
                     break;
                 }
@@ -433,6 +536,7 @@ Entity* en_collectable(Vector2 pos, EntityId id) {
 
 	en->type = ET_COLLECTABLE;
 	en->id = id;
+	en->trigger = true;
 
 	en_add_props(en, {EP_COLLIDABLE});
 
@@ -446,28 +550,38 @@ void en_collectable_update(Entity* self) {
 
 //:collectable
 void en_collectable_render(Entity self) {
-	draw_quad(v4v2(self.pos, self.size));
+	switch (self.id) {
+		case EID_BIRD:
+			draw_texture_v2(BIRD, self.pos);
+			break;
+		default:
+			draw_quad(v4v2(self.pos, self.size));
+			break;
+	}
 }
 
-Entity* en_collider(Vector2 pos, Vector2 size) {
+// :collider
+Entity* en_collider(Vector2 pos, Vector2 size, bool trigger = false) {
 	Entity* en = new_en();
 	
 	en_setup(en, pos, size);
 	en_add_props(en, {EP_COLLIDABLE});
+
+	en->trigger = trigger;
 
 	return en;
 }
 
 struct PlayerData {
 	bool wall_jump;
+	bool wall_jumped;
 };
 
 // :player
 Entity* en_player() {
 	Entity* en = new_en();
 
-	WorldPos pos = {0, MAP_SIZE - 12};
-	en_setup(en, to_render_pos(pos), v2of(16));
+	en_setup(en, ZERO, v2of(16));
 
 	en->user_data = arena_alloc(&arena, sizeof(PlayerData));
 
@@ -495,21 +609,27 @@ bool player_collide_callback(Entity* self) {
 		}
 	}
 
+	if (other->trigger) {
+		printf("Found trigger\n");
+	}
+
 	return true;
 }
 
 // :player
 void en_player_update(Entity* self) {
  	if(self->riding) {
-		self->vel.x = (self->riding->vel.x * self->riding->facing) * GetFrameTime();
+		self->vel.x = (self->riding->vel.x * self->riding->facing) * state->dt;
 	}	
-   
+  
+	PlayerData* data = (PlayerData*)self->user_data;
+	
 	if (IsKeyDown(KEY_A)) {
 		self->facing = -1;	
-        self->vel.x = approach(self->vel.x, -2.0, 22 * GetFrameTime());
+        self->vel.x = approach(self->vel.x, -2.0, 22 * state->dt);
     } else if (IsKeyDown(KEY_D)) {
 		self->facing = 1;
-        self->vel.x = approach(self->vel.x, 2.0, 22 * GetFrameTime());
+        self->vel.x = approach(self->vel.x, 2.0, 22 * state->dt);
     }
 
     if (IsKeyPressed(KEY_SPACE) && self->grounded) {
@@ -518,110 +638,270 @@ void en_player_update(Entity* self) {
 		self->riding = nullptr;
     }
 
-	PlayerData* data = (PlayerData*)self->user_data;
-
-	if (IsKeyPressed(KEY_SPACE) && data->wall_jump) {
-		self->vel.y = -5;
+	if (self->grounded) {
 		data->wall_jump = false;
+		data->wall_jumped = false;
+	}
+
+
+	if (IsKeyPressed(KEY_SPACE) && data->wall_jump && !data->wall_jumped) {
+		self->vel.y = -5;
+		data->wall_jumped = true;
 	}
 
     if (!IsKeyDown(KEY_A) && !IsKeyDown(KEY_D)) {
         if (self->grounded) {
-            self->vel.x = approach(self->vel.x, 0.0, 10 * GetFrameTime());
+            self->vel.x = approach(self->vel.x, 0.0, 10 * state->dt);
         } else {
-            self->vel.x = approach(self->vel.x, 0.0, 12 * GetFrameTime());
+            self->vel.x = approach(self->vel.x, 0.0, 12 * state->dt);
         }
     }
 
-	// fixme:
-
-
 	ListEntity collidables = get_all_with_prop(EP_COLLIDABLE, &temp_arena);
    	actor_move_x(collidables, self, self->vel.x, player_collide_callback);
-   	self->vel.y = approach(self->vel.y, 3.6, 13 * GetFrameTime());
+   	self->vel.y = approach(self->vel.y, 3.6, 13 * state->dt);
    	actor_move_y(collidables, self, self->vel.y, player_collide_callback);
-}
 
-struct MovingPlatData {
-	Vector2 start;
-	Vector2 end;
-	int p;
-};
-
-// :moving_plat
-Entity* en_moving_plat(Vector2 pos, Vector2 size, Vector2 start, Vector2 end) {
-	Entity* en = new_en();
-	
-	en_setup(en, pos, size);
-
-	en->type = ET_MOVING_PLAT;
-	en_add_props(en, {EP_MOVING, EP_COLLIDABLE});
-
-	MovingPlatData* user_data = (MovingPlatData*)arena_alloc(&arena, sizeof(MovingPlatData));
-	user_data->start = start;
-	user_data->end = end;
-	user_data->p = 0;
-
-	en->user_data = user_data;
-
-	en->vel.x = 100;
-
-	return en;
-}
-
-// :moving_plat
-void en_moving_plat_update(Entity* self) {
-	
-	MovingPlatData* data = (MovingPlatData*)self->user_data;
-
-	if (Vector2Equals(self->pos, data->start)) {
-		data->p = 1;
-		self->facing = -1;
-	} else if (Vector2Equals(self->pos, data->end)) {
-		data->p = 0;
-		self->facing = 1;
-	}
-
-	switch (data->p) {
-		case 0:
-			self->pos = Vector2MoveTowards(self->pos, data->start, self->vel.x * GetFrameTime());
-			break;
-		case 1:
-			self->pos = Vector2MoveTowards(self->pos, data->end, self->vel.x * GetFrameTime());
-			break;
-	
+	if (FloatEquals(self->vel.y, 0)) {
+		self->grounded = true;
 	}
 }
-
-// :moving_plat
-void en_moving_plat_render(Entity self) {
-	draw_quad(v4v2(self.pos, self.size));
-	MovingPlatData data = *(MovingPlatData*)self.user_data;
-	draw_quad(v4v2(data.end, v2of(1)), RED);
-	draw_quad(v4v2(data.start, v2of(1)), RED);
-}
-
-// :door
-Entity* en_door(Vector2 pos) {
-	Entity* en = new_en();
-	en_setup(en, pos, v2(16, 71));
-	en->type = ET_DOOR;
-
-	en_add_props(en, {EP_COLLIDABLE});
-
-	return en;
-}
-
-// :door
-void en_door_render(Entity self) {
-	//printf("Current layer: %d\n", renderer->current_layer);
-	draw_texture_v2(v4(64, 157, 17, 71), self.pos);
-}
-
 enum Layer {
 	L_NONE,
-	L_MAP,
+	L_BACK,
+	L_FLOWER,
+	L_WORKER,
+	L_DEBUG_COL,
+	L_HUD,
 };
+
+
+// :flower
+Entity* en_flower(Vector2 pos) {
+	Entity* en = new_en();
+
+	en_setup(en, pos, v2of(TILE_SIZE));
+	en->type = ET_FLOWER;
+
+	return en;
+}
+
+// :flower
+void en_flower_update(Entity* self) {
+	// noop
+}
+
+// :flower
+void en_flower_render(Entity self) {
+	push_layer(L_FLOWER);
+	draw_texture_v2(FLOWER_0, self.pos);
+	pop_layer();
+	push_layer(L_BACK);
+	draw_texture_v2(FLOWER_SPOT, {self.pos.x, self.pos.y + self.size.y / 2.f});
+	pop_layer();
+}
+
+struct Light {
+	Vector2 pos;
+	float radius;
+	Color color;
+
+	int loc_pos;
+	int loc_radius;
+	int loc_color;
+};
+
+static Light lights[MAX_LIGHTS] = {0};
+static int light_idx = 0;
+
+void update_light_data(Shader s, int id) {
+	Light l = lights[id];
+
+	float pos[2] = {l.pos.x, l.pos.y};
+	SetShaderValue(s, l.loc_pos, pos, SHADER_UNIFORM_VEC2);
+
+	SetShaderValue(s, l.loc_radius, &l.radius, SHADER_UNIFORM_FLOAT);
+
+	float color[4] = {l.color.r / 255.f, l.color.g / 255.f, l.color.b / 255.f, l.color.a / 255.f};
+	SetShaderValue(s, l.loc_color, color, SHADER_UNIFORM_VEC4);
+}
+
+void update_all_light_data(Shader s) {
+	for (int i = 0; i < MAX_LIGHTS; i++) {
+		update_light_data(s, i);	
+	}
+}
+
+int add_light(Shader s, Vector2 position, float radius, Color color) {
+	int id = light_idx;
+
+	lights[id].pos = position;
+	lights[id].radius = radius;
+	lights[id].color = color;
+
+	lights[id].loc_pos = GetShaderLocation(s, TextFormat("lights[%i].pos", id));
+	lights[id].loc_radius = GetShaderLocation(s, TextFormat("lights[%i].radius", id));
+	lights[id].loc_color = GetShaderLocation(s, TextFormat("lights[%i].color", id));
+
+	update_light_data(s, id);
+
+	light_idx += 1;
+
+	return id;
+}
+
+enum Task {
+	TASK_NONE,
+	TASK_COLLECT,
+	TASK_POLLINATE,
+};
+
+struct WorkerData {
+	Task task;
+	Entity* flower;
+};
+
+// :workers
+Entity* en_worker(Vector2 pos, Task task) {
+	Entity* en = new_en();
+
+	en_setup(en, pos, v2of(10));
+
+	en->type = ET_WORKER;
+
+	WorkerData* data = (WorkerData*)arena_alloc(&arena, sizeof(WorkerData));
+	data->task = task;
+
+	en->user_data = data;
+
+	return en;
+}
+
+// :worker
+void en_worker_update(Entity* self) {
+
+	WorkerData* data = (WorkerData*)self->user_data;
+
+	if (data->flower == nullptr && fdata.flowers.count > 0) {
+		int rnd_idx = GetRandomValue(0, fdata.flowers.count - 1);
+		data->flower = &state->entities[fdata.flowers.items[rnd_idx].handle];
+		assert(!data->flower->was_selected && "Flower is selected!");
+		data->flower->was_selected = true;
+	}
+
+	if (data->flower != nullptr) {
+
+		self->pos = Vector2MoveTowards(self->pos, data->flower->pos, 100 * state->dt);
+
+		if (Vector2Equals(self->pos, data->flower->pos)) {
+			en_invalidate(data->flower);
+			en_invalidate(self);
+		}
+	}
+}
+
+// :worker
+void en_worker_render(Entity self) {
+	push_layer(L_WORKER);
+	draw_quad(to_v4(en_box(self)), GOLD);
+	pop_layer();
+}
+
+// :thing
+struct ThingData {
+	ListEntity workers;
+	Task current_task;
+	float perform_task_time;
+	int food_amt;
+	int worker_amt;
+};
+
+#define PERFORM_TASK_TIME 1.2f
+#define WORKER_AMT 20
+#define START_FOOD_AMT 100
+
+// :thing
+Entity* en_thing(Vector2 pos, Vector2 size) {
+	Entity* en = new_en();
+
+	en_setup(en, pos, size);
+	en->type = ET_THING;
+
+	ThingData* data = (ThingData*)arena_alloc(&arena, sizeof(ThingData));
+	memset(data, 0, sizeof(ThingData));
+	data->perform_task_time = PERFORM_TASK_TIME;
+	data->current_task = TASK_NONE;
+	data->worker_amt = WORKER_AMT;
+	data->food_amt = START_FOOD_AMT;
+
+	en->user_data = data;
+
+	return en;
+}
+
+// :thing
+void en_thing_update(Entity* self) {
+
+	if(IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+		if (CheckCollisionPointRec(GetScreenToWorld2D(state->virtual_mouse, state->cam), en_box(*self))) {
+			state->show_thing_ui = true;
+		}
+	}
+
+	ThingData* data = (ThingData*)self->user_data;
+	
+	switch (data->current_task) {
+		case TASK_COLLECT:
+			data->perform_task_time -= state->dt * state->dt_speed;
+			if (data->perform_task_time < 0 && fdata.flowers.count > 0) {
+				en_worker(en_center(*self), data->current_task);
+				data->perform_task_time = PERFORM_TASK_TIME;
+			}
+			break;
+	}
+
+	
+}
+
+// :thing
+void en_thing_render(Entity self) {
+	push_layer(L_DEBUG_COL);
+	draw_texture_v2(THING, self.pos);
+	pop_layer();
+	draw_texture_v2(THING_SPOT, {(self.pos.x + (self.size.x - THING_SPOT.z) * .5f), (self.pos.y + self.size.y / 2)});
+}
+
+
+
+bool ui_btn(Vector2 pos, const char* text, float text_size) {
+
+	Vector4 dest = v4zw(96, 32);
+	dest.x = pos.x;
+	dest.y = pos.y;
+
+	bool hover = false;
+	bool clicked = false;
+
+	if (CheckCollisionPointRec(state->virtual_mouse, to_rect(dest))) {
+		hover = true;
+		if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+			clicked = true;
+		}
+	}
+
+	float text_sz = MeasureText(text, text_size);
+	Vector2 text_pos = { 
+		(dest.z - text_sz) * .5f, 
+		(dest.w - text_size) * .5f,
+	};
+
+	text_pos = xyv4(dest) + text_pos;
+
+	draw_texture_v2({128, hover ? 240.f : 208.f, 96, 32}, pos);
+	draw_text(text_pos, text, text_size);
+
+	return clicked;
+}
 
 int main(void) {
 
@@ -634,112 +914,107 @@ int main(void) {
 	// :load
 	Texture2D atlas = LoadTexture("./res/atlas.png");
 	RenderTexture2D game_texture = LoadRenderTexture(RENDER_SIZE.x, RENDER_SIZE.y);
+	RenderTexture2D light_texture = LoadRenderTexture(RENDER_SIZE.x, RENDER_SIZE.y);
+	Shader light_shader = LoadShader(nullptr, "./res/light_frag.glsl");
 
 	// :init
-	pop_tiles();
 	renderer = (Renderer*)arena_alloc(&arena, sizeof(Renderer));
 	memset(renderer->layers, 0, sizeof(RenderLayer) * MAX_LAYERS);
-	renderer->layer_stack = {};
+	renderer->layer_stack = {0};
 	renderer->current_layer = 0;
 	renderer->atlas = atlas;
-
-	Camera2D cam = {};
-	cam.zoom = 1.f;
-	cam.offset = RENDER_SIZE / v2of(2);
-
+	
 	state = (State*)arena_alloc(&arena, sizeof(State));
 	memset(state->map, -1, sizeof(int) * (MAP_SIZE * MAP_SIZE));
 	memset(state->entities, 0, sizeof(Entity) * MAX_ENTITIES);
+	state->dt_speed = 1;	
+	state->cam = Camera2D{};
+	state->cam.zoom = 1.f;
+	state->cam.offset = RENDER_SIZE / v2of(2);
 
-	state->player = en_player();
+	state->show_begin_message = true;
 
-	// :tiled
-	{
-		cute_tiled_map_t* map = cute_tiled_load_map_from_file("./res/map.tmj", nullptr);
+	Vector2 player_size = v2(48, 64);
+	Vector2 player_pos = ZERO - (player_size / 2);
+	state->player = en_thing(player_pos, player_size);
 
-		cute_tiled_layer_t* layer = map->layers;
-		while (layer) {
-			
+	bool lights_on = false;
+	add_light(light_shader, ZERO, PLAYER_LIGHT_RADIUS * TILE_SIZE, {255, 200, 37, 255});
 
-			if (strncmp("Colliders", layer->name.ptr, 9) == 0) {
-				cute_tiled_object_t* obj = layer->objects;
-				while (obj) {
-					en_collider(v2(obj->x, obj->y), v2(obj->width, obj->height));
-					obj = obj->next;
-				}
-			} else if (strncmp("map", layer->name.ptr, 3) == 0) {
-				assert(layer->data_count == MAP_SIZE * MAP_SIZE && "Map changed size! not handled in code");
-				for (int y = 0; y < MAP_SIZE; y++) {
-					for(int x = 0; x < MAP_SIZE; x++) {
-						if (layer->data[y * MAP_SIZE + x] != 0) {
-							state->map[y * MAP_SIZE + x] = layer->data[y * MAP_SIZE + x] - 1;
-						}
-					}
-				}
-			} else if (strncmp("points", layer->name.ptr, 6) == 0) {
-				cute_tiled_object_t* obj = layer->objects;
-				while (obj) {
-					
-					if (strncmp("spawn", obj->name.ptr, 5) == 0) {
-						state->player->pos = v2(obj->x, obj->y);
-					}
-
-					obj = obj->next;
-				}
-			} else if (strncmp("movables", layer->name.ptr, 8) == 0) {
-				cute_tiled_object_t* obj = layer->objects;
-				while (obj) {
-
-					assert(obj->property_count == 2 && "Movable not setup correctly");
-					
-					cute_tiled_property_t* props = obj->properties;
-					int dir = props[0].data.integer; 					
-					int tiles_move = props[1].data.integer;
-
-					Vector2 pos = v2(obj->x, obj->y);
-					// fixme: check out to this
-					Vector2 size = v2(3 * TILE_SIZE, TILE_SIZE);
-
-					// fixme: implement y
-					Vector2 end = {pos.x + (dir * (tiles_move * TILE_SIZE)), pos.y};
-
-					en_moving_plat(pos, size, pos, end);
-					
-					obj = obj->next;	
-				}
-			} else if (strncmp("doors", layer->name.ptr, 5) == 0) {
-				cute_tiled_object_t* obj = layer->objects;
-				while (obj) {
-					
-					en_door(v2(obj->x, obj->y));	
-
-					obj = obj->next;
-				}
-			} else {
-				printf("Layer not handled: %s\n", layer->name.ptr);
-			}
-
-			layer = layer->next;
-		}
-
-		cute_tiled_free_map(map);
-	}
 	assert(renderer != NULL && "arena returned null");
+
+
+	float flower_spawn_time = 2.f;
+	
+	for (int i = 0; i < 256; i++) {
+		Vector2 pos = v2(
+			GetRandomValue(-RENDER_SIZE.x/2, RENDER_SIZE.x/2),
+			GetRandomValue(-RENDER_SIZE.y/2, RENDER_SIZE.y/2)
+		);
+			
+		bool in_player = CheckCollisionPointRec(pos, to_rect(v4v2(player_pos, v2(48, 64))));
+		bool out_of_bounds = pos.x + 16 > RENDER_SIZE.x / 2 || pos.x < -RENDER_SIZE.x / 2 || pos.y + 16 > RENDER_SIZE.x / 2 || pos.y < -RENDER_SIZE.x / 2;
+		if(!in_player && !out_of_bounds) {
+			en_flower(pos);
+		}
+	}
 
 	// :loop
 	while(!WindowShouldClose()) {
-	
+
+		state->dt = GetFrameTime();
+		state->dt *= state->dt_speed;
+
 		arena_reset(&temp_arena);
+		fdata.flowers = {0};
+
+		float scale = fmin(WINDOW_SIZE.x / RENDER_SIZE.x, WINDOW_SIZE.y / RENDER_SIZE.y);
+		state->virtual_mouse = (GetMousePosition() - (WINDOW_SIZE - (RENDER_SIZE * scale)) * .5) / scale;
+		state->virtual_mouse = Vector2Clamp(state->virtual_mouse, ZERO, RENDER_SIZE);
 
 		// :update
 		{
-			en_player_update(state->player);
+			if (state->show_begin_message && IsKeyPressed(KEY_ENTER)) {
+				state->show_begin_message = false;
+			}
 
-			// :cam
+			// :spawn
+			//{
+			//	flower_spawn_time -= state->dt * state->dt_speed;
+			//	if (flower_spawn_time < 0) {
+			//		Vector2 pos = v2(
+			//				GetRandomValue(-RENDER_SIZE.x/2, RENDER_SIZE.x/2),
+			//				GetRandomValue(-RENDER_SIZE.y/2, RENDER_SIZE.y/2)
+			//		);
+		
+			//		bool in_player = CheckCollisionPointRec(pos, to_rect(v4v2(player_pos, v2(48, 64))));
+			//		bool out_of_bounds = pos.x + 16 > RENDER_SIZE.x / 2 || pos.x < -RENDER_SIZE.x / 2 || pos.y + 16 > RENDER_SIZE.x / 2 || pos.y < -RENDER_SIZE.x / 2;
+			//		if(!in_player && !out_of_bounds) {
+			//			en_flower(pos);
+			//		}
+
+
+			//		flower_spawn_time = 2.f;
+			//	}
+			//}
+
+			// :gather unselected flowers
 			{
-				cam.target = state->player->pos;
-				if (cam.target.x - cam.offset.x <= 0.0) {
-					cam.target.x = cam.offset.x;
+				for(Entity en : state->entities) {
+					if(en.valid && en.type == ET_FLOWER && !en.was_selected) {
+						arena_da_append(&temp_arena, &fdata.flowers, en);
+					}
+				}
+			}
+
+			// :debug
+			{
+				if (IsKeyPressed(KEY_L)) {
+					lights_on = !lights_on;
+				} else if(IsKeyPressed(KEY_K)) {
+					state->dt_speed += 1;
+				} else if(IsKeyPressed(KEY_J)) {
+					state->dt_speed -= 1;
 				}
 			}
 
@@ -752,47 +1027,26 @@ int main(void) {
 					case ET_COLLECTABLE:
 						en_collectable_update(en);
 						break;
-					case ET_MOVING_PLAT:
-						en_moving_plat_update(en);
+					case ET_THING:
+						en_thing_update(en);
+						break;
+					case ET_WORKER:
+						en_worker_update(en);
 						break;
 				}
 			}
 		}
 
+		
+
 		// :game_render
 		{
 			BeginTextureMode(game_texture);
 			{
-				ClearBackground(BLANK);
-				BeginMode2D(cam);
+				ClearBackground(BLACK);
+
+				BeginMode2D(state->cam);
 				{
-					// :map
-					{
-						printf("Before: %d\n", renderer->current_layer);
-						push_layer(L_MAP);
-						for(int y = 0; y < MAP_SIZE; y++) {
-							for(int x = 0; x < MAP_SIZE; x++) {
-								int tile_id = get_tile({x, y});
-								if(tile_id != -1) {
-									if(tiles_sprites.find(tile_id) != tiles_sprites.end()) {
-										Vector4 src = tiles_sprites[get_tile({x, y})];
-										draw_texture_v2(src, v2(x, y) * TILE_SIZE);
-									} else {
-										printf("Id: %d\n", tile_id);
-										exit(1);	
-									}
-								}
-							}
-						}
-						pop_layer();
-						printf("After: %d\n", renderer->current_layer);
-					}
-
-					// :player
-					{
-						draw_texture_v2(PLAYER, state->player->pos);
-					}
-
 					// :entities
 					{
 						for (Entity en: state->entities) {
@@ -803,28 +1057,178 @@ int main(void) {
 								case ET_COLLECTABLE:
 									en_collectable_render(en);
 									break;
-								case ET_MOVING_PLAT:
-									en_moving_plat_render(en);
+								case ET_FLOWER:
+									en_flower_render(en);
 									break;
-								case ET_DOOR:
-									en_door_render(en);
+								case ET_THING:
+									en_thing_render(en);
+									break;
+								case ET_WORKER:
+									en_worker_render(en);
 									break;
 							}
 						}
 					}
 
 #if 0
+					push_layer(L_DEBUG_COL);
 					ListEntity collidables = get_all_with_prop(EP_COLLIDABLE, &temp_arena);
 					for(int i = 0; i < collidables.count; i++) {
 						draw_quad_lines(to_v4(en_box(collidables.items[i])));
 					}
+					pop_layer();
 #endif
 
 					flush_renderer();
 				}
 				EndMode2D();
+
+				// :ui
+				{
+					if (state->show_thing_ui) {
+						Vector4 sprite = v4(528, 0, 304, 224);
+						Vector4 dest = v4zw(sprite.z, sprite.w);
+						dest.x = (RENDER_SIZE.x - dest.z) * .5f;
+						dest.y = (RENDER_SIZE.y - dest.w) * .5f;
+
+						float size = MeasureText("Perform task:", 20);
+						Vector4 title_dest = v4zw(size, 20);
+						start_of(dest, &title_dest);
+						center(dest, &title_dest, 0);
+						pad(&title_dest, TOP, 10);
+						
+						draw_texture_v2(sprite, xyv4(dest));
+						draw_text(xyv4(title_dest), "Perform task:", 20);
+					}
+				}
+
+				// :hud
+				{
+					push_layer(L_HUD);
+					{
+						Vector4 food_icon = {144, 160, 32, 32};
+						Vector4 food_dest = v4(10, 10, 32, 32);
+
+						ThingData data = *(ThingData*)state->player->user_data;
+						const char* foodstr = TextFormat("%d", data.food_amt);
+						float text_size = MeasureText(foodstr, 20);
+						Vector4 food_amt = v4zw(text_size, 20);
+						end_of(food_dest, &food_amt);
+						center(food_dest, &food_amt, 1);
+
+						Vector4 workers_dest = v4zw(32, 32);
+						start_of(food_dest, &workers_dest);
+						below(food_dest, &workers_dest);
+						pad(&food_amt, LEFT, 10);
+						
+						const char* workerstr = TextFormat("%d", data.worker_amt);
+						float workker_sz = MeasureText(workerstr, 20);
+						Vector4 worker_amt = v4zw(workker_sz, 20);
+						end_of(workers_dest, &worker_amt);
+						center(workers_dest, &worker_amt, 1);
+						pad(&worker_amt, LEFT, 10);
+
+						draw_texture_v2(food_icon, xyv4(food_dest));
+						draw_text(xyv4(food_amt), foodstr, 20);
+						draw_quad(workers_dest, GOLD);
+						draw_text(xyv4(worker_amt), workerstr, 20);
+					}
+					pop_layer();
+				}
+
+				// :message
+				{
+					if (state->show_begin_message) {
+						Vector4 sprite = v4(288, 0, 224, 304);
+						Vector4 dest = v4zw(sprite.z, sprite.w);
+						dest.x = (RENDER_SIZE.x - dest.z) * .5f;
+						dest.y = (RENDER_SIZE.y - dest.w) * .5f;
+
+						float size = MeasureText("Welcome", 20);
+						Vector4 title_dest = v4zw(size, 20);
+						start_of(dest, &title_dest);
+						center(dest, &title_dest, 0);
+						pad(&title_dest, TOP, 10);
+
+						Vector4 ok_btn = v4zw(100, 25);
+						start_of(dest, &ok_btn);
+						bottom_of(dest, &ok_btn);
+						center(dest, &ok_btn, 0);
+						pad(&ok_btn, BOTTOM, 10);
+
+						constexpr int message_len = 15;
+						const char* messages[message_len] = {
+							"It seems like you have been",
+							"given the task of managing this colony.",
+							"Try keeping it alive by managing ants.",
+							"They can collect food, build defenses,",
+							"pollinate and reproduce.",
+							"",
+							"Be aware the colony can't run out of",
+							"food, or the ant's will leave.",
+							"Every time your ants perform a task,",
+							"you will be asked to give",
+							"another task to them.",
+							"",
+							"Ocassionaly predators may appear, so try",
+							"to have that in mind when making your",
+							"ants go outside.",
+						};
+						
+						draw_texture_v2(sprite, xyv4(dest));
+						draw_text(xyv4(title_dest), "Welcome", 20);
+
+						float new_y = 0.f;
+						for (int i = 0; i < message_len; i++) {
+							float message_sz = MeasureText(messages[i], 10);
+							Vector4 message_dest = v4zw(message_sz, 10);
+							start_of(dest, &message_dest);
+							below(title_dest, &message_dest);
+							pad(&message_dest, TOP, 10);
+							center(dest, &message_dest, 0);
+							message_dest.y += i * message_dest.w;
+							draw_text(xyv4(message_dest), messages[i], 10);
+						}
+
+						if (ui_btn(xyv4(ok_btn), "Start", 10)) {
+							state->show_begin_message = false;
+							state->show_thing_ui = true;
+						}
+					}
+				}
+
+				flush_renderer();
 			}
 			EndTextureMode();
+		}
+		
+		// :light_texture
+		{
+			BeginTextureMode(light_texture);
+			{
+				ClearBackground(BLACK);
+				
+				BeginShaderMode(light_shader);
+				{
+					update_all_light_data(light_shader);	
+
+					DrawTexturePro(
+							game_texture.texture, 
+							{0, 0, float(game_texture.texture.width), float(game_texture.texture.height)},
+							{0, 0, RENDER_SIZE.x, RENDER_SIZE.y},
+							ZERO,
+							0, 
+							WHITE
+					);
+				}
+				EndShaderMode();
+			}
+			EndTextureMode();
+		}
+		
+		RenderTexture2D final = game_texture;
+		if(lights_on) {
+			final = light_texture;
 		}
 
 		BeginDrawing();
@@ -833,8 +1237,8 @@ int main(void) {
 		
 			float scale = std::min(float(GetScreenWidth()) / RENDER_SIZE.x, float(GetScreenHeight()) / RENDER_SIZE.y);
 			DrawTexturePro(
-				game_texture.texture,
-				{0, 0, float(game_texture.texture.width), float(-game_texture.texture.height)},
+				final.texture,
+				{0, 0, float(final.texture.width), float(-final.texture.height)},
 				{
 					(float(GetScreenWidth()) - (RENDER_SIZE.x * scale)) * 0.5f,
 					(float(GetScreenHeight()) - (RENDER_SIZE.y * scale)) * 0.5f,
@@ -846,8 +1250,8 @@ int main(void) {
 				WHITE
 			);
 
-			DrawFPS(10, 10);
-			DrawText(TextFormat("%f, %f", state->player->pos.x, state->player->pos.y), 10, 30, 20, WHITE);
+		
+			DrawFPS(10, WINDOW_SIZE.y - 20);
 		}
 		EndDrawing();
 	}
